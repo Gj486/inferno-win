@@ -1,7 +1,9 @@
-//! DanteBridge: receives Dante audio (via Inferno) and plays it to a Windows
-//! output device (e.g. VB-Cable). Use --tone to test without any mixer.
+//! DanteBridge: receives Dante audio (via Inferno) and plays it to Windows
+//! output devices (e.g. VB-Cable / VB-Matrix). Each device carries
+//! --channels channels (default 2). Use --tone to test without any mixer.
 
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -11,14 +13,13 @@ use inferno_aoip::device_server::{DeviceServer, Sample, Settings};
 const RATE: u32 = 48000;
 const TARGET_FRAMES: usize = 4800; // 100 ms buffer target
 
-struct Shared {
+struct Pair {
     q: VecDeque<f32>, // interleaved frames
     ch: usize,
     started: bool,
     frac: f64,
     underruns: u64,
     overruns: u64,
-    rx_frames: u64,
 }
 
 fn find_device(host: &cpal::Host, needle: &str) -> Option<cpal::Device> {
@@ -49,7 +50,24 @@ fn build_stream(
             break;
         }
     }
-    let supported = chosen.ok_or("device has no 48 kHz output with enough channels (set it to 48000 Hz in Windows Sound settings)")?;
+    let supported = match chosen {
+        Some(s) => s,
+        None => {
+            let mut msg = String::from("no usable 48 kHz F32 output. Device offers:");
+            if let Ok(cfgs) = device.supported_output_configs() {
+                for c in cfgs {
+                    msg.push_str(&format!(
+                        "\n  {} ch, {}-{} Hz, {:?}",
+                        c.channels(),
+                        c.min_sample_rate().0,
+                        c.max_sample_rate().0,
+                        c.sample_format()
+                    ));
+                }
+            }
+            return Err(msg);
+        }
+    };
     let out_ch = supported.channels() as usize;
     let config = supported.config();
     let stream = device
@@ -62,6 +80,51 @@ fn build_stream(
         .map_err(|e| e.to_string())?;
     stream.play().map_err(|e| e.to_string())?;
     Ok(stream)
+}
+
+fn fill_from_pair(shared: &Arc<Mutex<Pair>>, data: &mut [f32], out_ch: usize) {
+    let mut st = shared.lock().unwrap();
+    let n = st.ch;
+    if !st.started {
+        if st.q.len() / n >= TARGET_FRAMES {
+            st.started = true;
+            st.frac = 0.0;
+        } else {
+            data.fill(0.0);
+            return;
+        }
+    }
+    for frame in data.chunks_mut(out_ch) {
+        let avail = st.q.len() / n;
+        if avail < 2 {
+            if st.started {
+                st.underruns += 1;
+                st.started = false;
+            }
+            frame.fill(0.0);
+            continue;
+        }
+        // adaptive speed: follow the Dante clock by slightly changing read speed
+        let err = (avail as f64 - TARGET_FRAMES as f64) / TARGET_FRAMES as f64;
+        let step = (1.0 + err * 0.002).clamp(0.99, 1.01);
+        let f = st.frac as f32;
+        for c in 0..out_ch {
+            frame[c] = if c < n {
+                let a = st.q[c];
+                let b = st.q[n + c];
+                a + (b - a) * f
+            } else {
+                0.0
+            };
+        }
+        st.frac += step;
+        while st.frac >= 1.0 && st.q.len() >= n {
+            for _ in 0..n {
+                st.q.pop_front();
+            }
+            st.frac -= 1.0;
+        }
+    }
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -81,153 +144,140 @@ async fn main() {
     }
 
     let tone = args.iter().any(|a| a == "--tone");
-    let needle = args
+    let list_arg = args
         .iter()
-        .position(|a| a == "--device")
+        .position(|a| a == "--devices" || a == "--device")
         .and_then(|i| args.get(i + 1))
         .cloned()
         .unwrap_or_else(|| "cable input".to_string());
-    let channels: usize = args
+    let per: usize = args
         .iter()
         .position(|a| a == "--channels")
         .and_then(|i| args.get(i + 1))
         .and_then(|v| v.parse().ok())
         .unwrap_or(2);
 
-    let device = match find_device(&host, &needle) {
-        Some(d) => d,
-        None => {
-            eprintln!("Output device containing '{needle}' not found. Run with --list.");
-            return;
-        }
-    };
-    println!("Output device: {}", device.name().unwrap_or_default());
-
-    if tone {
-        let mut n: u64 = 0;
-        let _stream = match build_stream(&device, channels, move |data, out_ch| {
-            for frame in data.chunks_mut(out_ch) {
-                for (c, s) in frame.iter_mut().enumerate() {
-                    *s = if c < channels {
-                        let f = 1000.0 * (c as f64 + 1.0);
-                        (0.1 * (2.0 * std::f64::consts::PI * f * n as f64 / RATE as f64).sin()) as f32
-                    } else {
-                        0.0
-                    };
-                }
-                n = (n + 1) % RATE as u64;
+    let mut devices = Vec::new();
+    for needle in list_arg.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
+        match find_device(&host, needle) {
+            Some(d) => {
+                println!("Output device: {}", d.name().unwrap_or_default());
+                devices.push(d);
             }
-        }) {
-            Ok(s) => s,
-            Err(e) => {
-                eprintln!("{e}");
+            None => {
+                eprintln!("Output device containing '{needle}' not found. Run with --list.");
                 return;
             }
-        };
-        println!("Test tone: CH1 = 1 kHz, CH2 = 2 kHz (CH3 = 3 kHz ...). Press Ctrl+C to stop.");
+        }
+    }
+    if devices.is_empty() {
+        eprintln!("no devices given");
+        return;
+    }
+    let total = per * devices.len();
+
+    if tone {
+        let mut streams = Vec::new();
+        for (di, dev) in devices.iter().enumerate() {
+            let base = di * per;
+            let mut n: u64 = 0;
+            let result = build_stream(dev, per, move |data, out_ch| {
+                for frame in data.chunks_mut(out_ch) {
+                    for (c, s) in frame.iter_mut().enumerate() {
+                        *s = if c < per {
+                            let f = 1000.0 * ((base + c) as f64 + 1.0);
+                            (0.1 * (2.0 * std::f64::consts::PI * f * n as f64 / RATE as f64).sin()) as f32
+                        } else {
+                            0.0
+                        };
+                    }
+                    n = (n + 1) % RATE as u64;
+                }
+            });
+            match result {
+                Ok(s) => streams.push(s),
+                Err(e) => {
+                    eprintln!("{e}");
+                    return;
+                }
+            }
+        }
+        println!("Test tone: channel k = k kHz (CH1=1 kHz, CH2=2 kHz, ...). {total} channels. Ctrl+C to stop.");
         let _ = tokio::signal::ctrl_c().await;
         return;
     }
 
-    // ---- Dante receive -> ring buffer -> audio device ----
-    let shared = Arc::new(Mutex::new(Shared {
-        q: VecDeque::new(),
-        ch: channels,
-        started: false,
-        frac: 0.0,
-        underruns: 0,
-        overruns: 0,
-        rx_frames: 0,
-    }));
+    // ---- Dante receive -> one ring buffer per device -> audio devices ----
+    let pairs: Vec<Arc<Mutex<Pair>>> = (0..devices.len())
+        .map(|_| {
+            Arc::new(Mutex::new(Pair {
+                q: VecDeque::new(),
+                ch: per,
+                started: false,
+                frac: 0.0,
+                underruns: 0,
+                overruns: 0,
+            }))
+        })
+        .collect();
 
-    let shared_out = shared.clone();
-    let _stream = match build_stream(&device, channels, move |data, out_ch| {
-        let mut st = shared_out.lock().unwrap();
-        let n = st.ch;
-        if !st.started {
-            if st.q.len() / n >= TARGET_FRAMES {
-                st.started = true;
-                st.frac = 0.0;
-            } else {
-                data.fill(0.0);
+    let mut streams = Vec::new();
+    for (dev, pair) in devices.iter().zip(pairs.iter()) {
+        let p = pair.clone();
+        match build_stream(dev, per, move |data, out_ch| fill_from_pair(&p, data, out_ch)) {
+            Ok(s) => streams.push(s),
+            Err(e) => {
+                eprintln!("{e}");
                 return;
             }
         }
-        for frame in data.chunks_mut(out_ch) {
-            let avail = st.q.len() / n;
-            if avail < 2 {
-                if st.started {
-                    st.underruns += 1;
-                    st.started = false;
-                }
-                frame.fill(0.0);
-                continue;
-            }
-            // adaptive speed: follow the Dante clock by slightly changing read speed
-            let err = (avail as f64 - TARGET_FRAMES as f64) / TARGET_FRAMES as f64;
-            let step = (1.0 + err * 0.002).clamp(0.99, 1.01);
-            let f = st.frac as f32;
-            for c in 0..out_ch {
-                frame[c] = if c < n {
-                    let a = st.q[c];
-                    let b = st.q[n + c];
-                    a + (b - a) * f
-                } else {
-                    0.0
-                };
-            }
-            st.frac += step;
-            while st.frac >= 1.0 && st.q.len() >= n {
-                for _ in 0..n {
-                    st.q.pop_front();
-                }
-                st.frac -= 1.0;
-            }
-        }
-    }) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("{e}");
-            return;
-        }
-    };
+    }
 
-    let shared_stats = shared.clone();
+    let rx_frames = Arc::new(AtomicU64::new(0));
+    let stats_pairs = pairs.clone();
+    let stats_rx = rx_frames.clone();
     std::thread::spawn(move || loop {
         std::thread::sleep(Duration::from_secs(1));
-        let st = shared_stats.lock().unwrap();
-        println!(
-            "buffer {:.0} ms | rx frames {} | underruns {} | overruns {}",
-            (st.q.len() / st.ch) as f64 * 1000.0 / RATE as f64,
-            st.rx_frames,
-            st.underruns,
-            st.overruns
-        );
+        let mut line = format!("rx frames {}", stats_rx.load(Ordering::Relaxed));
+        for (i, p) in stats_pairs.iter().enumerate() {
+            let st = p.lock().unwrap();
+            line.push_str(&format!(
+                " | dev{} buf {:.0} ms underruns {} overruns {}",
+                i + 1,
+                (st.q.len() / st.ch) as f64 * 1000.0 / RATE as f64,
+                st.underruns,
+                st.overruns
+            ));
+        }
+        println!("{line}");
     });
 
     let mut settings = Settings::new("DanteBridge", "DanteBridge", None, &Default::default());
-    settings.make_rx_channels(channels);
+    settings.make_rx_channels(total);
     settings.make_tx_channels(0);
 
-    let shared_rx = shared.clone();
+    let rx_pairs = pairs.clone();
+    let rx_count = rx_frames.clone();
     let rx_callback = move |samples_count: usize, chans: &Vec<Vec<Sample>>| {
-        let mut st = shared_rx.lock().unwrap();
-        let n = st.ch;
-        if chans.len() < n {
+        if chans.len() < total {
             return;
         }
-        for si in 0..samples_count {
-            for c in 0..n {
-                st.q.push_back((chans[c][si] as f64 / 2147483648.0) as f32);
+        for (pi, pair) in rx_pairs.iter().enumerate() {
+            let mut st = pair.lock().unwrap();
+            let n = st.ch;
+            for si in 0..samples_count {
+                for c in 0..n {
+                    st.q.push_back((chans[pi * n + c][si] as f64 / 2147483648.0) as f32);
+                }
+            }
+            let frames = st.q.len() / n;
+            if frames > TARGET_FRAMES * 4 {
+                let drop = (frames - TARGET_FRAMES) * n;
+                st.q.drain(..drop);
+                st.overruns += 1;
             }
         }
-        st.rx_frames += samples_count as u64;
-        let frames = st.q.len() / n;
-        if frames > TARGET_FRAMES * 4 {
-            let drop = (frames - TARGET_FRAMES) * n;
-            st.q.drain(..drop);
-            st.overruns += 1;
-        }
+        rx_count.fetch_add(samples_count as u64, Ordering::Relaxed);
     };
 
     let mut server = DeviceServer::start(settings).await;
@@ -235,4 +285,5 @@ async fn main() {
 
     let _ = tokio::signal::ctrl_c().await;
     server.shutdown().await;
+    drop(streams);
 }
