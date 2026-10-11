@@ -15,19 +15,20 @@ jobs:
         run: |
           cp windows/usrvclock_lib.rs inferno-src/usrvclock-rs/src/lib.rs
           cp windows/usrvclock_Cargo.toml inferno-src/usrvclock-rs/Cargo.toml
-          cat > inferno-src/inferno_aoip/src/util/os.rs << 'EOF'
+          cat > inferno-src/inferno_aoip/src/util/os.rs << 'EOF2'
           use thread_priority::{Error, ThreadPriority};
 
           pub fn set_current_thread_realtime(_priority_hint: u8) -> Result<(), Error> {
             thread_priority::set_current_thread_priority(ThreadPriority::Max)
           }
-          EOF
+          EOF2
       - name: Add DanteBridge
         shell: bash
         run: |
           mkdir -p inferno-src/dante_bridge/src
           cp bridge/dante_bridge_Cargo.toml inferno-src/dante_bridge/Cargo.toml
           cp bridge/dante_bridge_main.rs inferno-src/dante_bridge/src/main.rs
+          cp bridge/dante_bridge.toml inferno-src/dante_bridge/src/dante_bridge.toml
           sed -i 's/"inferno2pipe",/"inferno2pipe",\n    "dante_bridge",/' inferno-src/Cargo.toml
           sed -i '/"alsa_pcm_inferno",/d' inferno-src/Cargo.toml
       - name: Build
@@ -38,9 +39,9 @@ jobs:
           cargo build --release -p inferno2pipe -p dante_bridge > ../full.log 2>&1 || echo "BUILD FAILED" > ../out/FAILED.txt
           grep -A14 "^error" ../full.log | head -300 > ../out/errors.txt || true
           tail -8 ../full.log > ../out/tail.txt || true
-          { for f in inferno_aoip/src/ring_buffer.rs inferno_aoip/src/device_server/flows_tx.rs inferno_aoip/src/device_server/samples_utils.rs inferno_aoip/src/common.rs; do echo "===== $f ====="; cat $f; done; } > ../out/sources4.txt || true
-          cp target/release/inferno2pipe.exe ../out/ || true
           cp target/release/dante_bridge.exe ../out/ || true
+          cp ../bridge/dante_bridge.toml ../out/ || true
+          cp ../bridge/start.bat ../out/ || true
       - uses: actions/upload-artifact@v4
         if: always()
         with:
