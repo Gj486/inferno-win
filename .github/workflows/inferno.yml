@@ -1,0 +1,23 @@
+name: Inferno
+on:
+  workflow_dispatch:
+  push:
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Get Inferno
+        shell: bash
+        run: git clone --recursive https://github.com/teodly/inferno inferno-src
+      - name: Build
+        shell: bash
+        working-directory: inferno-src
+        continue-on-error: true
+        run: |
+          cargo build --release 2>&1 | tee ../build.log
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: build-log
+          path: build.log
