@@ -1,13 +1,17 @@
 [package]
 name = "dante_bridge"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 
 [dependencies]
 inferno_aoip = { path = "../inferno_aoip" }
 cpal = "=0.15.3"
+crossterm = "=0.27.0"
 env_logger = "0.11"
+log = "0.4"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
 
 [dependencies.tokio]
 version = "1.36"
-features = ["signal", "macros", "rt"]
+features = ["signal", "macros", "rt", "time", "sync"]
