@@ -1,0 +1,32 @@
+# DanteBridge settings. Edit, save, then run dante_bridge.exe again.
+
+# Name shown in Dante Controller (max 31 characters).
+device_name = "DanteBridge"
+
+# IPv4 address of the Ethernet adapter connected to Dante (see ipconfig).
+# Leave empty to let the program choose (not recommended).
+bind_ip = ""
+
+# 0 = standard Dante ports. Use 14400 if another program (e.g. Dante
+# Virtual Soundcard / conmon_cmm_service) already uses ports 8700/8800.
+alt_port = 14400
+
+# Channels carried by each Windows audio device (VB-Matrix devices are stereo).
+channels_per_device = 2
+
+# Dante -> Windows. Windows OUTPUT devices (name contains, case-insensitive).
+# 2 devices x 2 channels = 4 Dante receive channels (RX 1..4).
+rx_devices = ["vbmatrix in 1", "vbmatrix in 2"]
+
+# Windows -> Dante. Windows INPUT (recording) devices.
+# Example for pink noise: ["vbmatrix out 3"]. Empty list = no transmit.
+tx_devices = []
+
+# Receive jitter buffer in milliseconds (bigger = safer, more delay).
+buffer_ms = 100
+
+# Transmit latency in milliseconds (bigger = safer, more delay).
+tx_latency_ms = 40
+
+# Log file dante_bridge.log next to the exe: error, warn, info, debug
+log_level = "info"
