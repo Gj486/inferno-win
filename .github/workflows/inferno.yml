@@ -29,6 +29,7 @@ jobs:
           cp bridge/dante_bridge_Cargo.toml inferno-src/dante_bridge/Cargo.toml
           cp bridge/dante_bridge_main.rs inferno-src/dante_bridge/src/main.rs
           sed -i 's/"inferno2pipe",/"inferno2pipe",\n    "dante_bridge",/' inferno-src/Cargo.toml
+          sed -i '/"alsa_pcm_inferno",/d' inferno-src/Cargo.toml
       - name: Build
         shell: bash
         working-directory: inferno-src
