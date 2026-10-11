@@ -22,15 +22,23 @@ jobs:
             thread_priority::set_current_thread_priority(ThreadPriority::Max)
           }
           EOF
-      - name: Build inferno2pipe
+      - name: Add DanteBridge
+        shell: bash
+        run: |
+          mkdir -p inferno-src/dante_bridge/src
+          cp bridge/dante_bridge_Cargo.toml inferno-src/dante_bridge/Cargo.toml
+          cp bridge/dante_bridge_main.rs inferno-src/dante_bridge/src/main.rs
+          sed -i 's/"inferno2pipe",/"inferno2pipe",\n    "dante_bridge",/' inferno-src/Cargo.toml
+      - name: Build
         shell: bash
         working-directory: inferno-src
         run: |
           mkdir -p ../out
-          cargo build --release -p inferno2pipe > ../full.log 2>&1 || echo "BUILD FAILED" > ../out/FAILED.txt
+          cargo build --release -p inferno2pipe -p dante_bridge > ../full.log 2>&1 || echo "BUILD FAILED" > ../out/FAILED.txt
           grep -A14 "^error" ../full.log | head -300 > ../out/errors.txt || true
           tail -8 ../full.log > ../out/tail.txt || true
           cp target/release/inferno2pipe.exe ../out/ || true
+          cp target/release/dante_bridge.exe ../out/ || true
       - uses: actions/upload-artifact@v4
         if: always()
         with:
