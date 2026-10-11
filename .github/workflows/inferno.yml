@@ -3,21 +3,27 @@ on:
   workflow_dispatch:
   push:
 jobs:
-  build:
+  inspect:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
       - name: Get Inferno
         shell: bash
         run: git clone --recursive https://github.com/teodly/inferno inferno-src
-      - name: Build
+      - name: Collect sources
         shell: bash
         working-directory: inferno-src
-        continue-on-error: true
         run: |
-          cargo build --release 2>&1 | tee ../build.log
+          {
+            echo "===== FILES ====="; find . -name "*.rs" -not -path "*/target/*" -not -path "./.git/*" | head -200
+            echo "===== Cargo.toml ====="; cat Cargo.toml
+            echo "===== inferno2pipe/Cargo.toml ====="; cat inferno2pipe/Cargo.toml
+            echo "===== inferno_aoip/Cargo.toml ====="; cat inferno_aoip/Cargo.toml
+            echo "===== usrvclock-rs/Cargo.toml ====="; cat usrvclock-rs/Cargo.toml
+            echo "===== usrvclock USAGE ====="; grep -rn "usrvclock" --include=*.rs inferno_aoip inferno2pipe alsa_pcm_inferno
+            echo "===== usrvclock-rs/src/lib.rs ====="; cat usrvclock-rs/src/lib.rs
+          } > ../sources.txt 2>&1
       - uses: actions/upload-artifact@v4
-        if: always()
         with:
-          name: build-log
-          path: build.log
+          name: sources
+          path: sources.txt
