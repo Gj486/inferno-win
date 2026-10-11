@@ -3,27 +3,31 @@ on:
   workflow_dispatch:
   push:
 jobs:
-  inspect:
+  build:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
       - name: Get Inferno
         shell: bash
         run: git clone --recursive https://github.com/teodly/inferno inferno-src
-      - name: Collect sources
+      - name: Apply Windows patch
+        shell: bash
+        run: |
+          cp windows/usrvclock_lib.rs inferno-src/usrvclock-rs/src/lib.rs
+          cp windows/usrvclock_Cargo.toml inferno-src/usrvclock-rs/Cargo.toml
+      - name: Build inferno2pipe
         shell: bash
         working-directory: inferno-src
         run: |
-          {
-            echo "===== FILES ====="; find . -name "*.rs" -not -path "*/target/*" -not -path "./.git/*" | head -200
-            echo "===== Cargo.toml ====="; cat Cargo.toml
-            echo "===== inferno2pipe/Cargo.toml ====="; cat inferno2pipe/Cargo.toml
-            echo "===== inferno_aoip/Cargo.toml ====="; cat inferno_aoip/Cargo.toml
-            echo "===== usrvclock-rs/Cargo.toml ====="; cat usrvclock-rs/Cargo.toml
-            echo "===== usrvclock USAGE ====="; grep -rn "usrvclock" --include=*.rs inferno_aoip inferno2pipe alsa_pcm_inferno
-            echo "===== usrvclock-rs/src/lib.rs ====="; cat usrvclock-rs/src/lib.rs
-          } > ../sources.txt 2>&1
+          mkdir -p ../out
+          cargo build --release -p inferno2pipe > ../full.log 2>&1 || echo "BUILD FAILED" > ../out/FAILED.txt
+          grep -v "Downloaded\|Downloading\|Compiling" ../full.log | head -250 > ../out/errors.txt || true
+          for f in inferno_aoip/src/media_clock.rs inferno2pipe/src/main.rs inferno_aoip/src/util/os.rs inferno_aoip/src/util/thread.rs; do
+            echo "===== $f ====="; cat $f
+          done > ../out/sources2.txt || true
+          cp target/release/inferno2pipe.exe ../out/ || true
       - uses: actions/upload-artifact@v4
+        if: always()
         with:
-          name: sources
-          path: sources.txt
+          name: result
+          path: out
