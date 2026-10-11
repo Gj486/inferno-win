@@ -38,6 +38,7 @@ jobs:
           cargo build --release -p inferno2pipe -p dante_bridge > ../full.log 2>&1 || echo "BUILD FAILED" > ../out/FAILED.txt
           grep -A14 "^error" ../full.log | head -300 > ../out/errors.txt || true
           tail -8 ../full.log > ../out/tail.txt || true
+          { for f in inferno_aoip/src/device_server/mod.rs inferno_aoip/src/device_server/settings.rs inferno_aoip/src/lib.rs alsa_pcm_inferno/src/lib.rs; do echo "===== $f ====="; cat $f; done; } > ../out/sources3.txt || true
           cp target/release/inferno2pipe.exe ../out/ || true
           cp target/release/dante_bridge.exe ../out/ || true
       - uses: actions/upload-artifact@v4
