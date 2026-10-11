@@ -15,16 +15,21 @@ jobs:
         run: |
           cp windows/usrvclock_lib.rs inferno-src/usrvclock-rs/src/lib.rs
           cp windows/usrvclock_Cargo.toml inferno-src/usrvclock-rs/Cargo.toml
+          cat > inferno-src/inferno_aoip/src/util/os.rs << 'EOF'
+          use thread_priority::{Error, ThreadPriority};
+
+          pub fn set_current_thread_realtime(_priority_hint: u8) -> Result<(), Error> {
+            thread_priority::set_current_thread_priority(ThreadPriority::Max)
+          }
+          EOF
       - name: Build inferno2pipe
         shell: bash
         working-directory: inferno-src
         run: |
           mkdir -p ../out
           cargo build --release -p inferno2pipe > ../full.log 2>&1 || echo "BUILD FAILED" > ../out/FAILED.txt
-          grep -v "Downloaded\|Downloading\|Compiling" ../full.log | head -250 > ../out/errors.txt || true
-          for f in inferno_aoip/src/media_clock.rs inferno2pipe/src/main.rs inferno_aoip/src/util/os.rs inferno_aoip/src/util/thread.rs; do
-            echo "===== $f ====="; cat $f
-          done > ../out/sources2.txt || true
+          grep -A14 "^error" ../full.log | head -300 > ../out/errors.txt || true
+          tail -8 ../full.log > ../out/tail.txt || true
           cp target/release/inferno2pipe.exe ../out/ || true
       - uses: actions/upload-artifact@v4
         if: always()
