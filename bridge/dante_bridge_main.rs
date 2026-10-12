@@ -1,41 +1,33 @@
-//! DanteBridge v0.2
+#![windows_subsystem = "windows"]
+//! DanteBridge v0.3 - graphical version.
 //!   Dante -> Windows  (receive from Dante, play to Windows output devices)
 //!   Windows -> Dante  (record from Windows input devices, transmit to Dante)
-//! Colored text screen + dante_bridge.toml settings file.
+//! Settings are edited in the window and saved to dante_bridge.toml.
 //!
 //! NOTE: the media clock here is the local PC clock (no PTP lock to Dante).
 
 use std::collections::{BTreeMap, VecDeque};
-use std::io::Write;
 use std::net::Ipv4Addr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use crossterm::{
-    cursor::{Hide, MoveTo, Show},
-    event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
-    execute, queue,
-    style::{Color, Print, ResetColor, SetForegroundColor},
-    terminal::{self, Clear, ClearType},
-};
+use eframe::egui;
 use inferno_aoip::device_server::{
     AtomicSample, Clock, DeviceServer, ExternalBufferParameters, MediaClock, Sample, Settings,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 const RATE: u32 = 48000;
 const RING: usize = 65536; // samples per TX channel ring (power of two)
 const TX_TOL: isize = 240; // 5 ms: drift tolerance before correcting
 const TX_RESYNC: isize = 4800; // 100 ms: hard resync threshold
 
-const DEFAULT_CONFIG: &str = include_str!("dante_bridge.toml");
-
 // ---------------------------------------------------------------- config
 
-#[derive(Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Clone)]
 #[serde(default)]
 struct Config {
     device_name: String,
@@ -72,16 +64,21 @@ fn exe_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
 }
 
+fn config_path() -> PathBuf {
+    exe_dir().join("dante_bridge.toml")
+}
+
+fn save_config(cfg: &Config) -> Result<(), String> {
+    let text = toml::to_string_pretty(cfg).map_err(|e| e.to_string())?;
+    std::fs::write(config_path(), text).map_err(|e| e.to_string())
+}
+
 // ---------------------------------------------------------------- shared state
 
-struct Pair {
-    q: VecDeque<f32>, // interleaved frames
-    ch: usize,
-    target: usize,
-    started: bool,
-    frac: f64,
-    underruns: u64,
-    overruns: u64,
+struct DevStat {
+    buf_frames: AtomicU64,
+    under: AtomicU64,
+    over: AtomicU64,
 }
 
 struct Stats {
@@ -91,12 +88,55 @@ struct Stats {
     tx_resyncs: AtomicU64,
     rx_peaks: Vec<AtomicU32>, // f32 bits, peak since last UI read
     tx_peaks: Vec<AtomicU32>,
-    quit: AtomicBool,
-    reset: AtomicBool,
+    rx_dev: Vec<DevStat>,
 }
 
-fn atomics(n: usize) -> Vec<AtomicU32> {
-    (0..n).map(|_| AtomicU32::new(0)).collect()
+impl Stats {
+    fn new(rx_ch: usize, tx_ch: usize, rx_devs: usize) -> Self {
+        Self {
+            rx_frames: AtomicU64::new(0),
+            tx_frames: AtomicU64::new(0),
+            tx_corrections: AtomicU64::new(0),
+            tx_resyncs: AtomicU64::new(0),
+            rx_peaks: (0..rx_ch).map(|_| AtomicU32::new(0)).collect(),
+            tx_peaks: (0..tx_ch).map(|_| AtomicU32::new(0)).collect(),
+            rx_dev: (0..rx_devs)
+                .map(|_| DevStat {
+                    buf_frames: AtomicU64::new(0),
+                    under: AtomicU64::new(0),
+                    over: AtomicU64::new(0),
+                })
+                .collect(),
+        }
+    }
+
+    fn reset_counters(&self) {
+        self.tx_corrections.store(0, Ordering::Relaxed);
+        self.tx_resyncs.store(0, Ordering::Relaxed);
+        for d in &self.rx_dev {
+            d.under.store(0, Ordering::Relaxed);
+            d.over.store(0, Ordering::Relaxed);
+        }
+    }
+}
+
+struct Shared {
+    stats: Mutex<Option<Arc<Stats>>>,
+    status: Mutex<String>,
+    running: AtomicBool,
+    stop: AtomicBool,
+}
+
+fn set_status(shared: &Shared, text: impl Into<String>) {
+    *shared.status.lock().unwrap() = text.into();
+}
+
+struct Pair {
+    q: VecDeque<f32>, // interleaved frames
+    ch: usize,
+    target: usize,
+    started: bool,
+    frac: f64,
 }
 
 // ---------------------------------------------------------------- audio devices
@@ -108,9 +148,18 @@ fn find_device(host: &cpal::Host, needle: &str, input: bool) -> Option<cpal::Dev
     } else {
         host.output_devices().ok()?.collect()
     };
-    devs.into_iter().find(|d| {
-        d.name().map(|n| n.to_lowercase().contains(&needle)).unwrap_or(false)
-    })
+    devs.into_iter()
+        .find(|d| d.name().map(|n| n.to_lowercase().contains(&needle)).unwrap_or(false))
+}
+
+fn device_names(input: bool) -> Vec<String> {
+    let host = cpal::default_host();
+    let devs: Vec<cpal::Device> = if input {
+        host.input_devices().map(|d| d.collect()).unwrap_or_default()
+    } else {
+        host.output_devices().map(|d| d.collect()).unwrap_or_default()
+    };
+    devs.iter().filter_map(|d| d.name().ok()).collect()
 }
 
 fn describe_configs<I: Iterator<Item = cpal::SupportedStreamConfigRange>>(cfgs: I) -> String {
@@ -150,7 +199,7 @@ fn build_output(
                 .supported_output_configs()
                 .map(|c| describe_configs(c))
                 .unwrap_or_default();
-            return Err(format!("no usable 48 kHz F32 output. Device offers:{offers}"));
+            return Err(format!("no usable 48 kHz output (need {channels} ch). Device offers:{offers}"));
         }
     };
     let out_ch = supported.channels() as usize;
@@ -190,7 +239,7 @@ fn build_input(
                 .supported_input_configs()
                 .map(|c| describe_configs(c))
                 .unwrap_or_default();
-            return Err(format!("no usable 48 kHz F32 input. Device offers:{offers}"));
+            return Err(format!("no usable 48 kHz input (need {channels} ch). Device offers:{offers}"));
         }
     };
     let in_ch = supported.channels() as usize;
@@ -207,9 +256,10 @@ fn build_input(
     Ok(stream)
 }
 
-fn fill_from_pair(shared: &Arc<Mutex<Pair>>, data: &mut [f32], out_ch: usize) {
+fn fill_from_pair(shared: &Arc<Mutex<Pair>>, dev: &DevStat, data: &mut [f32], out_ch: usize) {
     let mut st = shared.lock().unwrap();
     let n = st.ch;
+    dev.buf_frames.store((st.q.len() / n) as u64, Ordering::Relaxed);
     if !st.started {
         if st.q.len() / n >= st.target {
             st.started = true;
@@ -223,7 +273,7 @@ fn fill_from_pair(shared: &Arc<Mutex<Pair>>, data: &mut [f32], out_ch: usize) {
         let avail = st.q.len() / n;
         if avail < 2 {
             if st.started {
-                st.underruns += 1;
+                dev.under.fetch_add(1, Ordering::Relaxed);
                 st.started = false;
             }
             frame.fill(0.0);
@@ -273,246 +323,53 @@ fn new_ring() -> &'static [AtomicSample] {
     Box::leak(v.into_boxed_slice())
 }
 
-// ---------------------------------------------------------------- text UI
+// ---------------------------------------------------------------- engine
 
-struct UiInfo {
-    name: String,
-    ip: String,
-    rx_names: Vec<String>,
-    tx_names: Vec<String>,
-    per: usize,
-}
-
-fn text_line<W: Write>(out: &mut W, color: Color, text: &str) {
-    let _ = queue!(
-        out,
-        SetForegroundColor(color),
-        Print(text),
-        ResetColor,
-        Clear(ClearType::UntilNewLine),
-        Print("\r\n")
-    );
-}
-
-fn meter<W: Write>(out: &mut W, label: &str, peak: f32) {
-    let db = if peak > 0.00003 { 20.0 * peak.log10() } else { -90.0 };
-    let filled = (((db + 60.0) / 60.0).clamp(0.0, 1.0) * 20.0).round() as usize;
-    let color = if db > -3.0 {
-        Color::Red
-    } else if db > -12.0 {
-        Color::Yellow
-    } else {
-        Color::Green
+fn engine_thread(cfg: Config, shared: Arc<Shared>, tone: bool) {
+    let result = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+        Ok(rt) => rt.block_on(run_engine(cfg, shared.clone(), tone)),
+        Err(e) => Err(format!("cannot start runtime: {e}")),
     };
-    let _ = queue!(
-        out,
-        Print(format!("    {label:<6}[")),
-        SetForegroundColor(color),
-        Print("#".repeat(filled)),
-        ResetColor,
-        Print("-".repeat(20 - filled)),
-        Print(format!("] {db:6.1} dB")),
-        Clear(ClearType::UntilNewLine),
-        Print("\r\n")
-    );
-}
-
-fn ui_thread(info: UiInfo, stats: Arc<Stats>, pairs: Vec<Arc<Mutex<Pair>>>) {
-    let mut out = std::io::stdout();
-    let _ = terminal::enable_raw_mode();
-    let _ = execute!(out, Hide, Clear(ClearType::All));
-    let mut rx_disp = vec![0f32; stats.rx_peaks.len()];
-    let mut tx_disp = vec![0f32; stats.tx_peaks.len()];
-    let started = Instant::now();
-
-    loop {
-        for (i, p) in stats.rx_peaks.iter().enumerate() {
-            let v = f32::from_bits(p.swap(0, Ordering::Relaxed));
-            rx_disp[i] = v.max(rx_disp[i] * 0.85);
-        }
-        for (i, p) in stats.tx_peaks.iter().enumerate() {
-            let v = f32::from_bits(p.swap(0, Ordering::Relaxed));
-            tx_disp[i] = v.max(tx_disp[i] * 0.85);
-        }
-
-        let up = started.elapsed().as_secs();
-        let _ = queue!(out, MoveTo(0, 0));
-        text_line(&mut out, Color::Cyan, " DANTE BRIDGE v0.2  (local clock - not PTP locked)");
-        text_line(
-            &mut out,
-            Color::White,
-            &format!(
-                " Name: {}   IP: {}   48 kHz   up {:02}:{:02}:{:02}",
-                info.name,
-                if info.ip.is_empty() { "auto" } else { &info.ip },
-                up / 3600,
-                (up / 60) % 60,
-                up % 60
-            ),
-        );
-        text_line(&mut out, Color::DarkGrey, "");
-
-        text_line(
-            &mut out,
-            Color::Yellow,
-            &format!(
-                " Dante -> Windows   frames received: {}",
-                stats.rx_frames.load(Ordering::Relaxed)
-            ),
-        );
-        if info.rx_names.is_empty() {
-            text_line(&mut out, Color::DarkGrey, "    (no rx_devices configured)");
-        }
-        for (di, name) in info.rx_names.iter().enumerate() {
-            let (buf_ms, under, over) = {
-                let st = pairs[di].lock().unwrap();
-                ((st.q.len() / st.ch) as f64 * 1000.0 / RATE as f64, st.underruns, st.overruns)
-            };
-            let c = if under > 0 || over > 0 { Color::Red } else { Color::Green };
-            text_line(
-                &mut out,
-                c,
-                &format!("  {name}   buf {buf_ms:.0} ms   underruns {under}   overruns {over}"),
-            );
-            for ch in 0..info.per {
-                let gi = di * info.per + ch;
-                meter(&mut out, &format!("RX {}", gi + 1), rx_disp[gi]);
-            }
-        }
-        text_line(&mut out, Color::DarkGrey, "");
-
-        text_line(
-            &mut out,
-            Color::Yellow,
-            &format!(
-                " Windows -> Dante   frames sent: {}   drift fixes: {}   resyncs: {}",
-                stats.tx_frames.load(Ordering::Relaxed),
-                stats.tx_corrections.load(Ordering::Relaxed),
-                stats.tx_resyncs.load(Ordering::Relaxed)
-            ),
-        );
-        if info.tx_names.is_empty() {
-            text_line(&mut out, Color::DarkGrey, "    (no tx_devices configured)");
-        }
-        for (di, name) in info.tx_names.iter().enumerate() {
-            text_line(&mut out, Color::Green, &format!("  {name}"));
-            for ch in 0..info.per {
-                let gi = di * info.per + ch;
-                meter(&mut out, &format!("TX {}", gi + 1), tx_disp[gi]);
-            }
-        }
-        text_line(&mut out, Color::DarkGrey, "");
-        text_line(&mut out, Color::DarkGrey, " q = quit    r = reset counters");
-        let _ = queue!(out, Clear(ClearType::FromCursorDown));
-        let _ = out.flush();
-
-        if event::poll(Duration::from_millis(150)).unwrap_or(false) {
-            if let Ok(Event::Key(k)) = event::read() {
-                if k.kind == KeyEventKind::Press {
-                    match k.code {
-                        KeyCode::Char('q') | KeyCode::Char('Q') => {
-                            stats.quit.store(true, Ordering::Relaxed)
-                        }
-                        KeyCode::Char('c') if k.modifiers.contains(KeyModifiers::CONTROL) => {
-                            stats.quit.store(true, Ordering::Relaxed)
-                        }
-                        KeyCode::Char('r') | KeyCode::Char('R') => {
-                            for p in &pairs {
-                                let mut st = p.lock().unwrap();
-                                st.underruns = 0;
-                                st.overruns = 0;
-                            }
-                            stats.tx_corrections.store(0, Ordering::Relaxed);
-                            stats.tx_resyncs.store(0, Ordering::Relaxed);
-                            stats.reset.store(true, Ordering::Relaxed);
-                        }
-                        _ => {}
-                    }
-                }
-            }
-        }
-        if stats.quit.load(Ordering::Relaxed) {
-            break;
-        }
-    }
-    let _ = execute!(out, Show, ResetColor);
-    let _ = terminal::disable_raw_mode();
-    println!();
-}
-
-// ---------------------------------------------------------------- main
-
-#[tokio::main(flavor = "current_thread")]
-async fn main() {
-    let args: Vec<String> = std::env::args().collect();
-    let host = cpal::default_host();
-
-    if args.iter().any(|a| a == "--list") {
-        println!("Output devices (use in rx_devices):");
-        if let Ok(devs) = host.output_devices() {
-            for d in devs {
-                println!("  {}", d.name().unwrap_or_default());
-            }
-        }
-        println!("Input devices (use in tx_devices):");
-        if let Ok(devs) = host.input_devices() {
-            for d in devs {
-                println!("  {}", d.name().unwrap_or_default());
-            }
-        }
-        return;
-    }
-
-    // ---- config file
-    let cfg_path = exe_dir().join("dante_bridge.toml");
-    if !cfg_path.exists() {
-        match std::fs::write(&cfg_path, DEFAULT_CONFIG) {
-            Ok(_) => println!(
-                "Created settings file:\n  {}\nEdit it (set bind_ip), save, and run again.",
-                cfg_path.display()
-            ),
-            Err(e) => eprintln!("Could not create {}: {e}", cfg_path.display()),
-        }
-        return;
-    }
-    let cfg: Config = match std::fs::read_to_string(&cfg_path)
-        .map_err(|e| e.to_string())
-        .and_then(|t| toml::from_str(&t).map_err(|e| e.to_string()))
-    {
-        Ok(c) => c,
+    *shared.stats.lock().unwrap() = None;
+    match result {
+        Ok(()) => set_status(&shared, "Stopped"),
         Err(e) => {
-            eprintln!("Error in {}:\n{e}", cfg_path.display());
-            return;
+            log::error!("engine error: {e}");
+            set_status(&shared, format!("ERROR: {e}"));
         }
-    };
-
-    // ---- log to file (keeps the screen clean)
-    {
-        let mut b = env_logger::Builder::new();
-        b.parse_filters(&cfg.log_level);
-        if let Ok(f) = std::fs::File::create(exe_dir().join("dante_bridge.log")) {
-            b.target(env_logger::Target::Pipe(Box::new(f)));
-        }
-        b.init();
     }
+    shared.running.store(false, Ordering::SeqCst);
+}
 
+async fn run_engine(cfg: Config, shared: Arc<Shared>, tone: bool) -> Result<(), String> {
+    let host = cpal::default_host();
     let per = cfg.channels_per_device.max(1);
 
-    // ---- tone test mode: plays 1 kHz, 2 kHz, ... on the rx_devices
-    if args.iter().any(|a| a == "--tone") {
+    let mut rx_devs = Vec::new();
+    for needle in &cfg.rx_devices {
+        let d = find_device(&host, needle, false)
+            .ok_or(format!("Output device '{needle}' not found"))?;
+        rx_devs.push(d);
+    }
+    let mut tx_devs = Vec::new();
+    for needle in &cfg.tx_devices {
+        let d = find_device(&host, needle, true)
+            .ok_or(format!("Input device '{needle}' not found"))?;
+        tx_devs.push(d);
+    }
+    let rx_total = per * rx_devs.len();
+    let tx_total = per * tx_devs.len();
+
+    // ---- tone test: 1 kHz, 2 kHz, ... on the rx devices, no Dante at all
+    if tone {
+        if rx_devs.is_empty() {
+            return Err("no output devices selected".into());
+        }
         let mut streams = Vec::new();
-        for (di, needle) in cfg.rx_devices.iter().enumerate() {
-            let dev = match find_device(&host, needle, false) {
-                Some(d) => d,
-                None => {
-                    eprintln!("Output device containing '{needle}' not found. Try --list.");
-                    return;
-                }
-            };
-            println!("Output device: {}", dev.name().unwrap_or_default());
+        for (di, dev) in rx_devs.iter().enumerate() {
             let base = di * per;
             let mut n: u64 = 0;
-            match build_output(&dev, per, move |data, out_ch| {
+            streams.push(build_output(dev, per, move |data, out_ch| {
                 for frame in data.chunks_mut(out_ch) {
                     for (c, s) in frame.iter_mut().enumerate() {
                         *s = if c < per {
@@ -525,61 +382,24 @@ async fn main() {
                     }
                     n = (n + 1) % RATE as u64;
                 }
-            }) {
-                Ok(s) => streams.push(s),
-                Err(e) => {
-                    eprintln!("{e}");
-                    return;
-                }
-            }
+            })?);
         }
-        println!("Test tone running: channel k = k kHz. Press Ctrl+C to stop.");
-        let _ = tokio::signal::ctrl_c().await;
-        return;
-    }
-
-    // ---- find devices
-    let mut rx_devs = Vec::new();
-    let mut rx_names = Vec::new();
-    for needle in &cfg.rx_devices {
-        match find_device(&host, needle, false) {
-            Some(d) => {
-                rx_names.push(d.name().unwrap_or_default());
-                rx_devs.push(d);
-            }
-            None => {
-                eprintln!("Output device containing '{needle}' not found. Run: dante_bridge.exe --list");
-                return;
-            }
+        set_status(&shared, "Test tone running (channel k = k kHz)");
+        while !shared.stop.load(Ordering::Relaxed) {
+            tokio::time::sleep(Duration::from_millis(100)).await;
         }
+        return Ok(());
     }
-    let mut tx_devs = Vec::new();
-    let mut tx_names = Vec::new();
-    for needle in &cfg.tx_devices {
-        match find_device(&host, needle, true) {
-            Some(d) => {
-                tx_names.push(d.name().unwrap_or_default());
-                tx_devs.push(d);
-            }
-            None => {
-                eprintln!("Input device containing '{needle}' not found. Run: dante_bridge.exe --list");
-                return;
-            }
-        }
-    }
-    let rx_total = per * rx_devs.len();
-    let tx_total = per * tx_devs.len();
 
     let my_ip: Option<Ipv4Addr> = if cfg.bind_ip.trim().is_empty() {
         None
     } else {
-        match cfg.bind_ip.trim().parse() {
-            Ok(ip) => Some(ip),
-            Err(_) => {
-                eprintln!("bind_ip in settings is not a valid IPv4 address: {}", cfg.bind_ip);
-                return;
-            }
-        }
+        Some(
+            cfg.bind_ip
+                .trim()
+                .parse()
+                .map_err(|_| format!("'{}' is not a valid IPv4 address", cfg.bind_ip))?,
+        )
     };
 
     let mut conf: BTreeMap<String, String> = BTreeMap::new();
@@ -587,27 +407,16 @@ async fn main() {
     if cfg.alt_port != 0 {
         conf.insert("ALT_PORT".to_string(), cfg.alt_port.to_string());
     }
-    conf.insert(
-        "TX_LATENCY_NS".to_string(),
-        (cfg.tx_latency_ms as u64 * 1_000_000).to_string(),
-    );
+    conf.insert("TX_LATENCY_NS".to_string(), (cfg.tx_latency_ms as u64 * 1_000_000).to_string());
     let mut settings = Settings::new(&cfg.device_name, "DanteBridge", my_ip, &conf);
     settings.make_rx_channels(rx_total);
     settings.make_tx_channels(tx_total);
 
-    let stats = Arc::new(Stats {
-        rx_frames: AtomicU64::new(0),
-        tx_frames: AtomicU64::new(0),
-        tx_corrections: AtomicU64::new(0),
-        tx_resyncs: AtomicU64::new(0),
-        rx_peaks: atomics(rx_total),
-        tx_peaks: atomics(tx_total),
-        quit: AtomicBool::new(false),
-        reset: AtomicBool::new(false),
-    });
+    let stats = Arc::new(Stats::new(rx_total, tx_total, rx_devs.len()));
+    *shared.stats.lock().unwrap() = Some(stats.clone());
 
     // ---- Dante receive -> Windows output devices
-    let target = (cfg.buffer_ms.max(20)) * (RATE as usize) / 1000;
+    let target = cfg.buffer_ms.max(20) * (RATE as usize) / 1000;
     let pairs: Vec<Arc<Mutex<Pair>>> = (0..rx_devs.len())
         .map(|_| {
             Arc::new(Mutex::new(Pair {
@@ -616,22 +425,17 @@ async fn main() {
                 target,
                 started: false,
                 frac: 0.0,
-                underruns: 0,
-                overruns: 0,
             }))
         })
         .collect();
 
     let mut rx_streams = Vec::new();
-    for (dev, pair) in rx_devs.iter().zip(pairs.iter()) {
+    for (di, (dev, pair)) in rx_devs.iter().zip(pairs.iter()).enumerate() {
         let p = pair.clone();
-        match build_output(dev, per, move |data, out_ch| fill_from_pair(&p, data, out_ch)) {
-            Ok(s) => rx_streams.push(s),
-            Err(e) => {
-                eprintln!("Cannot open output device: {e}");
-                return;
-            }
-        }
+        let st = stats.clone();
+        rx_streams.push(build_output(dev, per, move |data, out_ch| {
+            fill_from_pair(&p, &st.rx_dev[di], data, out_ch)
+        })?);
     }
 
     let mut server = DeviceServer::start(settings).await;
@@ -655,7 +459,7 @@ async fn main() {
                 if frames > q.target * 4 {
                     let drop = (frames - q.target) * n;
                     q.q.drain(..drop);
-                    q.overruns += 1;
+                    st.rx_dev[pi].over.fetch_add(1, Ordering::Relaxed);
                 }
                 for c in 0..n {
                     let peak = chans[pi * n + c][..samples_count]
@@ -675,20 +479,12 @@ async fn main() {
     // ---- Windows input devices -> Dante transmit
     let mut tx_streams = Vec::new();
     if tx_total > 0 {
-        let mc0 = match make_media_clock(&server).await {
-            Some(m) => m,
-            None => {
-                eprintln!("media clock not available");
-                return;
-            }
-        };
-        let start: Clock = match mc0.wrapping_now_in_timebase(RATE as u64) {
-            Some(s) => s,
-            None => {
-                eprintln!("media clock not ready");
-                return;
-            }
-        };
+        let mc0 = make_media_clock(&server)
+            .await
+            .ok_or("media clock not available".to_string())?;
+        let start: Clock = mc0
+            .wrapping_now_in_timebase(RATE as u64)
+            .ok_or("media clock not ready".to_string())?;
         let valid = Arc::new(RwLock::new(true));
         let mut params: Vec<ExternalBufferParameters<Sample>> = Vec::new();
 
@@ -702,18 +498,14 @@ async fn main() {
                 });
                 bufs.push(b);
             }
-            let media = match make_media_clock(&server).await {
-                Some(m) => m,
-                None => {
-                    eprintln!("media clock not available");
-                    return;
-                }
-            };
+            let media = make_media_clock(&server)
+                .await
+                .ok_or("media clock not available".to_string())?;
             let st = stats.clone();
             let ch_base = di * per;
             let mut w: usize = 0;
             let mut first = true;
-            let result = build_input(dev, per, move |data, in_ch| {
+            tx_streams.push(build_input(dev, per, move |data, in_ch| {
                 let n = data.len() / in_ch;
                 if n == 0 {
                     return;
@@ -753,14 +545,7 @@ async fn main() {
                 }
                 w += n_out;
                 st.tx_frames.fetch_add(n as u64, Ordering::Relaxed);
-            });
-            match result {
-                Ok(s) => tx_streams.push(s),
-                Err(e) => {
-                    eprintln!("Cannot open input device: {e}");
-                    return;
-                }
-            }
+            })?);
         }
 
         let (start_tx, start_rx) = tokio::sync::oneshot::channel::<Clock>();
@@ -775,24 +560,426 @@ async fn main() {
         let _ = start_tx.send(start);
     }
 
-    // ---- text screen
-    let info = UiInfo {
-        name: cfg.device_name.clone(),
-        ip: cfg.bind_ip.clone(),
-        rx_names,
-        tx_names,
-        per,
-    };
-    let ui_stats = stats.clone();
-    let ui_pairs = pairs.clone();
-    let ui = std::thread::spawn(move || ui_thread(info, ui_stats, ui_pairs));
-
-    while !stats.quit.load(Ordering::Relaxed) {
+    set_status(&shared, "Running");
+    while !shared.stop.load(Ordering::Relaxed) {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    let _ = ui.join();
 
     drop(rx_streams);
     drop(tx_streams);
     server.shutdown().await;
+    Ok(())
+}
+
+// ---------------------------------------------------------------- GUI
+
+fn list_nets() -> Vec<(String, String)> {
+    let mut v = vec![("auto".to_string(), String::new())];
+    if let Ok(list) = local_ip_address::list_afinet_netifas() {
+        for (name, ip) in list {
+            if let std::net::IpAddr::V4(v4) = ip {
+                if !v4.is_loopback() {
+                    v.push((name, v4.to_string()));
+                }
+            }
+        }
+    }
+    v
+}
+
+fn meter_bar(ui: &mut egui::Ui, label: &str, peak: f32) {
+    let db = if peak > 0.00003 { 20.0 * peak.log10() } else { -90.0 };
+    let frac = ((db + 60.0) / 60.0).clamp(0.0, 1.0);
+    let color = if db > -3.0 {
+        egui::Color32::from_rgb(220, 60, 60)
+    } else if db > -12.0 {
+        egui::Color32::from_rgb(230, 200, 60)
+    } else {
+        egui::Color32::from_rgb(70, 200, 90)
+    };
+    ui.horizontal(|ui| {
+        ui.label(egui::RichText::new(label).monospace());
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(170.0, 14.0), egui::Sense::hover());
+        let painter = ui.painter();
+        painter.rect_filled(rect, 2.0, egui::Color32::from_gray(45));
+        let fill = egui::Rect::from_min_size(rect.min, egui::vec2(rect.width() * frac, rect.height()));
+        painter.rect_filled(fill, 2.0, color);
+        ui.label(egui::RichText::new(format!("{db:6.1} dB")).monospace());
+    });
+}
+
+enum Action {
+    Start,
+    Tone,
+    Stop,
+    Save,
+    Refresh,
+    ResetCounters,
+}
+
+struct App {
+    cfg: Config,
+    shared: Arc<Shared>,
+    out_names: Vec<String>,
+    in_names: Vec<String>,
+    nets: Vec<(String, String)>,
+    rx_disp: Vec<f32>,
+    tx_disp: Vec<f32>,
+    note: String,
+}
+
+impl App {
+    fn new(cfg: Config, note: String) -> Self {
+        Self {
+            cfg,
+            shared: Arc::new(Shared {
+                stats: Mutex::new(None),
+                status: Mutex::new("Stopped".to_string()),
+                running: AtomicBool::new(false),
+                stop: AtomicBool::new(false),
+            }),
+            out_names: device_names(false),
+            in_names: device_names(true),
+            nets: list_nets(),
+            rx_disp: vec![],
+            tx_disp: vec![],
+            note,
+        }
+    }
+
+    fn start(&mut self, tone: bool) {
+        if self.shared.running.load(Ordering::SeqCst) {
+            return;
+        }
+        if let Err(e) = save_config(&self.cfg) {
+            self.note = format!("Could not save settings: {e}");
+        }
+        self.shared.stop.store(false, Ordering::SeqCst);
+        self.shared.running.store(true, Ordering::SeqCst);
+        set_status(&self.shared, "Starting...");
+        let cfg = self.cfg.clone();
+        let shared = self.shared.clone();
+        std::thread::spawn(move || engine_thread(cfg, shared, tone));
+    }
+}
+
+fn device_picker(
+    ui: &mut egui::Ui,
+    id: &str,
+    list: &mut Vec<String>,
+    names: &[String],
+    add_label: &str,
+) {
+    let mut remove: Option<usize> = None;
+    for i in 0..list.len() {
+        ui.horizontal(|ui| {
+            egui::ComboBox::from_id_source((id, i))
+                .width(330.0)
+                .selected_text(list[i].clone())
+                .show_ui(ui, |ui| {
+                    for n in names {
+                        ui.selectable_value(&mut list[i], n.clone(), n);
+                    }
+                });
+            if ui.button("Remove").clicked() {
+                remove = Some(i);
+            }
+        });
+    }
+    if let Some(i) = remove {
+        list.remove(i);
+    }
+    if ui.button(add_label).clicked() {
+        list.push(names.first().cloned().unwrap_or_default());
+    }
+}
+
+impl eframe::App for App {
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        ctx.request_repaint_after(Duration::from_millis(50));
+        let running = self.shared.running.load(Ordering::SeqCst);
+        let stats = self.shared.stats.lock().unwrap().clone();
+        let status = self.shared.status.lock().unwrap().clone();
+
+        // meters with decay
+        if let Some(s) = &stats {
+            if self.rx_disp.len() != s.rx_peaks.len() {
+                self.rx_disp = vec![0.0; s.rx_peaks.len()];
+            }
+            if self.tx_disp.len() != s.tx_peaks.len() {
+                self.tx_disp = vec![0.0; s.tx_peaks.len()];
+            }
+            for (i, p) in s.rx_peaks.iter().enumerate() {
+                let v = f32::from_bits(p.swap(0, Ordering::Relaxed));
+                self.rx_disp[i] = v.max(self.rx_disp[i] * 0.85);
+            }
+            for (i, p) in s.tx_peaks.iter().enumerate() {
+                let v = f32::from_bits(p.swap(0, Ordering::Relaxed));
+                self.tx_disp[i] = v.max(self.tx_disp[i] * 0.85);
+            }
+        } else {
+            self.rx_disp.clear();
+            self.tx_disp.clear();
+        }
+
+        let mut action: Option<Action> = None;
+        let per = self.cfg.channels_per_device.max(1);
+
+        egui::CentralPanel::default().show(ctx, |ui| {
+            egui::ScrollArea::vertical().show(ui, |ui| {
+                ui.heading("Dante Bridge");
+                ui.label(
+                    egui::RichText::new("local clock - not PTP locked")
+                        .small()
+                        .color(egui::Color32::GRAY),
+                );
+                ui.add_space(6.0);
+
+                // ---- controls
+                ui.horizontal(|ui| {
+                    if ui.add_enabled(!running, egui::Button::new("Start")).clicked() {
+                        action = Some(Action::Start);
+                    }
+                    if ui.add_enabled(running, egui::Button::new("Stop")).clicked() {
+                        action = Some(Action::Stop);
+                    }
+                    if ui
+                        .add_enabled(!running, egui::Button::new("Test tone (no Dante)"))
+                        .clicked()
+                    {
+                        action = Some(Action::Tone);
+                    }
+                    if ui.button("Reset counters").clicked() {
+                        action = Some(Action::ResetCounters);
+                    }
+                });
+                let status_color = if status.starts_with("ERROR") {
+                    egui::Color32::from_rgb(220, 60, 60)
+                } else if status == "Running" {
+                    egui::Color32::from_rgb(70, 200, 90)
+                } else {
+                    egui::Color32::GRAY
+                };
+                ui.label(egui::RichText::new(format!("Status: {status}")).color(status_color));
+                if !self.note.is_empty() {
+                    ui.label(egui::RichText::new(self.note.clone()).color(egui::Color32::YELLOW));
+                }
+                ui.separator();
+
+                // ---- meters
+                if let Some(s) = &stats {
+                    ui.columns(2, |cols| {
+                        cols[0].label(
+                            egui::RichText::new(format!(
+                                "Dante -> Windows   frames: {}",
+                                s.rx_frames.load(Ordering::Relaxed)
+                            ))
+                            .strong(),
+                        );
+                        for (di, name) in self.cfg.rx_devices.iter().enumerate() {
+                            if di >= s.rx_dev.len() {
+                                break;
+                            }
+                            let d = &s.rx_dev[di];
+                            let under = d.under.load(Ordering::Relaxed);
+                            let over = d.over.load(Ordering::Relaxed);
+                            let col = if under > 0 || over > 0 {
+                                egui::Color32::from_rgb(220, 60, 60)
+                            } else {
+                                egui::Color32::from_rgb(70, 200, 90)
+                            };
+                            cols[0].label(egui::RichText::new(name.clone()).small());
+                            cols[0].label(
+                                egui::RichText::new(format!(
+                                    "buffer {:.0} ms   underruns {}   overruns {}",
+                                    d.buf_frames.load(Ordering::Relaxed) as f64 * 1000.0
+                                        / RATE as f64,
+                                    under,
+                                    over
+                                ))
+                                .small()
+                                .color(col),
+                            );
+                            for ch in 0..per {
+                                let gi = di * per + ch;
+                                if gi < self.rx_disp.len() {
+                                    meter_bar(&mut cols[0], &format!("RX{}", gi + 1), self.rx_disp[gi]);
+                                }
+                            }
+                        }
+
+                        cols[1].label(
+                            egui::RichText::new(format!(
+                                "Windows -> Dante   frames: {}",
+                                s.tx_frames.load(Ordering::Relaxed)
+                            ))
+                            .strong(),
+                        );
+                        cols[1].label(
+                            egui::RichText::new(format!(
+                                "drift fixes {}   resyncs {}",
+                                s.tx_corrections.load(Ordering::Relaxed),
+                                s.tx_resyncs.load(Ordering::Relaxed)
+                            ))
+                            .small(),
+                        );
+                        for (di, name) in self.cfg.tx_devices.iter().enumerate() {
+                            cols[1].label(egui::RichText::new(name.clone()).small());
+                            for ch in 0..per {
+                                let gi = di * per + ch;
+                                if gi < self.tx_disp.len() {
+                                    meter_bar(&mut cols[1], &format!("TX{}", gi + 1), self.tx_disp[gi]);
+                                }
+                            }
+                        }
+                    });
+                    ui.separator();
+                }
+
+                // ---- settings (locked while running)
+                ui.add_enabled_ui(!running, |ui| {
+                    egui::CollapsingHeader::new("Settings")
+                        .default_open(!running)
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.label("Device name in Dante Controller:");
+                                ui.text_edit_singleline(&mut self.cfg.device_name);
+                            });
+                            ui.horizontal(|ui| {
+                                ui.label("Network adapter (Ethernet to Dante):");
+                                let shown = if self.cfg.bind_ip.is_empty() {
+                                    "auto".to_string()
+                                } else {
+                                    self.cfg.bind_ip.clone()
+                                };
+                                egui::ComboBox::from_id_source("bind_ip")
+                                    .width(260.0)
+                                    .selected_text(shown)
+                                    .show_ui(ui, |ui| {
+                                        for (name, ip) in &self.nets {
+                                            ui.selectable_value(
+                                                &mut self.cfg.bind_ip,
+                                                ip.clone(),
+                                                format!("{name}  {ip}"),
+                                            );
+                                        }
+                                    });
+                            });
+                            ui.horizontal(|ui| {
+                                ui.label("Alternative port (0 = standard):");
+                                ui.add(egui::DragValue::new(&mut self.cfg.alt_port).clamp_range(0..=65535));
+                            });
+                            ui.horizontal(|ui| {
+                                ui.label("Channels per Windows device:");
+                                ui.add(
+                                    egui::DragValue::new(&mut self.cfg.channels_per_device)
+                                        .clamp_range(1..=8),
+                                );
+                            });
+                            ui.horizontal(|ui| {
+                                ui.label("Receive buffer (ms):");
+                                ui.add(egui::DragValue::new(&mut self.cfg.buffer_ms).clamp_range(20..=1000));
+                                ui.label("Transmit latency (ms):");
+                                ui.add(
+                                    egui::DragValue::new(&mut self.cfg.tx_latency_ms).clamp_range(5..=500),
+                                );
+                            });
+                            ui.add_space(4.0);
+                            ui.label(
+                                egui::RichText::new("Dante -> Windows (Windows output devices)").strong(),
+                            );
+                            device_picker(ui, "rx", &mut self.cfg.rx_devices, &self.out_names, "+ Add output device");
+                            ui.add_space(4.0);
+                            ui.label(
+                                egui::RichText::new("Windows -> Dante (Windows input devices)").strong(),
+                            );
+                            device_picker(ui, "tx", &mut self.cfg.tx_devices, &self.in_names, "+ Add input device");
+                            ui.add_space(6.0);
+                            ui.horizontal(|ui| {
+                                if ui.button("Save settings").clicked() {
+                                    action = Some(Action::Save);
+                                }
+                                if ui.button("Refresh device list").clicked() {
+                                    action = Some(Action::Refresh);
+                                }
+                            });
+                        });
+                });
+            });
+        });
+
+        match action {
+            Some(Action::Start) => {
+                self.note.clear();
+                self.start(false);
+            }
+            Some(Action::Tone) => {
+                self.note.clear();
+                self.start(true);
+            }
+            Some(Action::Stop) => {
+                self.shared.stop.store(true, Ordering::SeqCst);
+                set_status(&self.shared, "Stopping...");
+            }
+            Some(Action::Save) => {
+                self.note = match save_config(&self.cfg) {
+                    Ok(_) => "Settings saved.".to_string(),
+                    Err(e) => format!("Could not save settings: {e}"),
+                };
+            }
+            Some(Action::Refresh) => {
+                self.out_names = device_names(false);
+                self.in_names = device_names(true);
+                self.nets = list_nets();
+            }
+            Some(Action::ResetCounters) => {
+                if let Some(s) = &stats {
+                    s.reset_counters();
+                }
+            }
+            None => {}
+        }
+    }
+
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        self.shared.stop.store(true, Ordering::SeqCst);
+        std::thread::sleep(Duration::from_millis(400));
+    }
+}
+
+fn main() -> eframe::Result<()> {
+    let mut note = String::new();
+    let cfg: Config = match std::fs::read_to_string(config_path()) {
+        Ok(t) => match toml::from_str(&t) {
+            Ok(c) => c,
+            Err(e) => {
+                note = format!("Error in dante_bridge.toml (using defaults): {e}");
+                Config::default()
+            }
+        },
+        Err(_) => Config::default(),
+    };
+
+    // log to a file next to the exe
+    {
+        let mut b = env_logger::Builder::new();
+        b.parse_filters(&cfg.log_level);
+        if let Ok(f) = std::fs::File::create(exe_dir().join("dante_bridge.log")) {
+            b.target(env_logger::Target::Pipe(Box::new(f)));
+        }
+        b.init();
+    }
+    std::panic::set_hook(Box::new(|info| log::error!("PANIC: {info}")));
+
+    let options = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default()
+            .with_inner_size([820.0, 720.0])
+            .with_title("Dante Bridge"),
+        ..Default::default()
+    };
+    eframe::run_native(
+        "Dante Bridge",
+        options,
+        Box::new(move |_cc| Box::new(App::new(cfg, note))),
+    )
 }
