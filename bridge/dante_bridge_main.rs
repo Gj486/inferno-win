@@ -5,13 +5,17 @@
 //! Settings are edited in the window and saved to dante_bridge.toml.
 //!
 //! NOTE: the media clock here is the local PC clock (no PTP lock to Dante).
+//! v0.4: optional ASIO mode - audio goes through the "Dante Bridge ASIO" driver
+//! (4 in / 4 out) instead of VB-Matrix, via shared memory (shm.rs).
+
+mod shm;
 
 use std::collections::{BTreeMap, VecDeque};
 use std::net::Ipv4Addr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use eframe::egui;
@@ -39,6 +43,7 @@ struct Config {
     buffer_ms: usize,
     tx_latency_ms: u32,
     log_level: String,
+    use_asio: bool,
 }
 
 impl Default for Config {
@@ -53,6 +58,7 @@ impl Default for Config {
             buffer_ms: 100,
             tx_latency_ms: 40,
             log_level: "info".into(),
+            use_asio: false,
         }
     }
 }
@@ -89,6 +95,7 @@ struct Stats {
     rx_peaks: Vec<AtomicU32>, // f32 bits, peak since last UI read
     tx_peaks: Vec<AtomicU32>,
     rx_dev: Vec<DevStat>,
+    asio_host: AtomicBool,
 }
 
 impl Stats {
@@ -100,6 +107,7 @@ impl Stats {
             tx_resyncs: AtomicU64::new(0),
             rx_peaks: (0..rx_ch).map(|_| AtomicU32::new(0)).collect(),
             tx_peaks: (0..tx_ch).map(|_| AtomicU32::new(0)).collect(),
+            asio_host: AtomicBool::new(false),
             rx_dev: (0..rx_devs)
                 .map(|_| DevStat {
                     buf_frames: AtomicU64::new(0),
@@ -323,6 +331,111 @@ fn new_ring() -> &'static [AtomicSample] {
     Box::leak(v.into_boxed_slice())
 }
 
+// ---------------------------------------------------------------- Dante transmit helper
+
+struct TxWriter {
+    bufs: Vec<&'static [AtomicSample]>,
+    per: usize,
+    ch_base: usize,
+    w: usize,
+    first: bool,
+    start: Clock,
+    media: MediaClock,
+    st: Arc<Stats>,
+}
+
+impl TxWriter {
+    /// `data` = interleaved f32 frames with `in_ch` channels per frame (first `per` are used).
+    /// Call it when a chunk of audio has just been captured.
+    fn push(&mut self, data: &[f32], in_ch: usize) {
+        let n = data.len() / in_ch;
+        if n == 0 {
+            return;
+        }
+        let now = match self.media.wrapping_now_in_timebase(RATE as u64) {
+            Some(v) => v,
+            None => return,
+        };
+        let m = now.wrapping_sub(self.start) as isize; // media samples elapsed
+        if self.first {
+            self.w = (m - n as isize).max(0) as usize;
+            self.first = false;
+        }
+        let e = (self.w + n) as isize - m; // >0: we are ahead of the media clock
+        let mut n_out = n as isize;
+        if e.abs() > TX_RESYNC {
+            self.w = (m - n as isize).max(0) as usize;
+            self.st.tx_resyncs.fetch_add(1, Ordering::Relaxed);
+        } else if e > TX_TOL {
+            n_out -= 1; // drop one sample
+            self.st.tx_corrections.fetch_add(1, Ordering::Relaxed);
+        } else if e < -TX_TOL {
+            n_out += 1; // repeat one sample
+            self.st.tx_corrections.fetch_add(1, Ordering::Relaxed);
+        }
+        let n_out = n_out.max(1) as usize;
+        for c in 0..self.per {
+            let mut peak = 0f32;
+            for i in 0..n_out {
+                let src = i.min(n - 1);
+                let s = data[src * in_ch + c];
+                peak = peak.max(s.abs());
+                let v = (s.clamp(-1.0, 1.0) as f64 * 2147483647.0) as i32;
+                self.bufs[c][(self.w + i) & (RING - 1)].store(v, Ordering::Relaxed);
+            }
+            self.st.tx_peaks[self.ch_base + c].fetch_max(peak.to_bits(), Ordering::Relaxed);
+        }
+        self.w += n_out;
+        self.st.tx_frames.fetch_add(n as u64, Ordering::Relaxed);
+    }
+}
+
+/// Reads what the ASIO host plays (shared memory "Out" ring) and sends it to Dante.
+/// When no host is playing, it keeps the Dante ring filled with silence.
+fn asio_reader(mut writer: TxWriter, shm: Arc<shm::Shm>, shared: Arc<Shared>, st: Arc<Stats>) {
+    let ch = shm::CH;
+    let mut rd = shm.write_pos(shm::Dir::Out);
+    let mut buf: Vec<f32> = Vec::new();
+    let mut last_data = Instant::now();
+    let mut last_push = Instant::now();
+    let mut last_beat = shm.driver_beat();
+    let mut last_beat_change = Instant::now();
+    while !shared.stop.load(Ordering::Relaxed) {
+        std::thread::sleep(Duration::from_millis(2));
+        shm.bump_bridge_beat();
+        let beat = shm.driver_beat();
+        if beat != last_beat {
+            last_beat = beat;
+            last_beat_change = Instant::now();
+        }
+        st.asio_host
+            .store(last_beat_change.elapsed() < Duration::from_millis(1000), Ordering::Relaxed);
+
+        let wp = shm.write_pos(shm::Dir::Out);
+        let mut avail = wp.wrapping_sub(rd) as i64;
+        if avail < 0 || avail > (shm::FRAMES as i64) / 2 {
+            rd = wp;
+            avail = 0;
+        }
+        if avail > 0 {
+            buf.resize(avail as usize * ch, 0.0);
+            shm.read_frames(shm::Dir::Out, rd, &mut buf);
+            rd = wp;
+            writer.push(&buf, ch);
+            last_data = Instant::now();
+            last_push = last_data;
+        } else if last_data.elapsed() > Duration::from_millis(60) {
+            let n = (last_push.elapsed().as_secs_f64() * RATE as f64) as usize;
+            if n > 0 {
+                buf.clear();
+                buf.resize(n * ch, 0.0);
+                writer.push(&buf, ch);
+                last_push = Instant::now();
+            }
+        }
+    }
+}
+
 // ---------------------------------------------------------------- engine
 
 fn engine_thread(cfg: Config, shared: Arc<Shared>, tone: bool) {
@@ -357,8 +470,12 @@ async fn run_engine(cfg: Config, shared: Arc<Shared>, tone: bool) -> Result<(), 
             .ok_or(format!("Input device '{needle}' not found"))?;
         tx_devs.push(d);
     }
+    let use_asio = cfg.use_asio;
+    let tx_devs: Vec<cpal::Device> = if use_asio { Vec::new() } else { tx_devs };
     let rx_total = per * rx_devs.len();
     let tx_total = per * tx_devs.len();
+    let rx_dante = if use_asio { rx_total.max(shm::CH) } else { rx_total };
+    let tx_dante = if use_asio { shm::CH } else { tx_total };
 
     // ---- tone test: 1 kHz, 2 kHz, ... on the rx devices, no Dante at all
     if tone {
@@ -409,11 +526,19 @@ async fn run_engine(cfg: Config, shared: Arc<Shared>, tone: bool) -> Result<(), 
     }
     conf.insert("TX_LATENCY_NS".to_string(), (cfg.tx_latency_ms as u64 * 1_000_000).to_string());
     let mut settings = Settings::new(&cfg.device_name, "DanteBridge", my_ip, &conf);
-    settings.make_rx_channels(rx_total);
-    settings.make_tx_channels(tx_total);
+    settings.make_rx_channels(rx_dante);
+    settings.make_tx_channels(tx_dante);
 
-    let stats = Arc::new(Stats::new(rx_total, tx_total, rx_devs.len()));
+    let stats = Arc::new(Stats::new(rx_dante, tx_dante, rx_devs.len()));
     *shared.stats.lock().unwrap() = Some(stats.clone());
+
+    let asio_shm: Option<Arc<shm::Shm>> = if use_asio {
+        let m = shm::Shm::open().map_err(|e| format!("shared memory: {e}"))?;
+        m.reset();
+        Some(Arc::new(m))
+    } else {
+        None
+    };
 
     // ---- Dante receive -> Windows output devices
     let target = cfg.buffer_ms.max(20) * (RATE as usize) / 1000;
@@ -440,11 +565,13 @@ async fn run_engine(cfg: Config, shared: Arc<Shared>, tone: bool) -> Result<(), 
 
     let mut server = DeviceServer::start(settings).await;
 
-    if rx_total > 0 {
+    if rx_dante > 0 {
         let rx_pairs = pairs.clone();
         let st = stats.clone();
+        let shm_rx = asio_shm.clone();
+        let mut tmp: Vec<f32> = Vec::new();
         let rx_callback = move |samples_count: usize, chans: &Vec<Vec<Sample>>| {
-            if chans.len() < rx_total {
+            if chans.len() < rx_dante {
                 return;
             }
             for (pi, pair) in rx_pairs.iter().enumerate() {
@@ -461,24 +588,36 @@ async fn run_engine(cfg: Config, shared: Arc<Shared>, tone: bool) -> Result<(), 
                     q.q.drain(..drop);
                     st.rx_dev[pi].over.fetch_add(1, Ordering::Relaxed);
                 }
-                for c in 0..n {
-                    let peak = chans[pi * n + c][..samples_count]
-                        .iter()
-                        .map(|s| (*s as i64).abs())
-                        .max()
-                        .unwrap_or(0);
-                    let pf = (peak as f64 / 2147483648.0) as f32;
-                    st.rx_peaks[pi * n + c].fetch_max(pf.to_bits(), Ordering::Relaxed);
+            }
+            for c in 0..rx_dante {
+                let peak = chans[c][..samples_count]
+                    .iter()
+                    .map(|s| (*s as i64).abs())
+                    .max()
+                    .unwrap_or(0);
+                let pf = (peak as f64 / 2147483648.0) as f32;
+                st.rx_peaks[c].fetch_max(pf.to_bits(), Ordering::Relaxed);
+            }
+            if let Some(m) = &shm_rx {
+                tmp.clear();
+                for si in 0..samples_count {
+                    for c in 0..shm::CH {
+                        tmp.push((chans[c][si] as f64 / 2147483648.0) as f32);
+                    }
                 }
+                let wp = m.write_pos(shm::Dir::In);
+                m.write_frames(shm::Dir::In, wp, &tmp);
+                m.set_write_pos(shm::Dir::In, wp + samples_count as u64);
             }
             st.rx_frames.fetch_add(samples_count as u64, Ordering::Relaxed);
         };
         server.receive_with_callback(Box::new(rx_callback)).await;
     }
 
-    // ---- Windows input devices -> Dante transmit
+    // ---- transmit to Dante: from Windows input devices, or from the ASIO driver
     let mut tx_streams = Vec::new();
-    if tx_total > 0 {
+    let mut asio_thread: Option<std::thread::JoinHandle<()>> = None;
+    if tx_dante > 0 {
         let mc0 = make_media_clock(&server)
             .await
             .ok_or("media clock not available".to_string())?;
@@ -501,51 +640,42 @@ async fn run_engine(cfg: Config, shared: Arc<Shared>, tone: bool) -> Result<(), 
             let media = make_media_clock(&server)
                 .await
                 .ok_or("media clock not available".to_string())?;
-            let st = stats.clone();
-            let ch_base = di * per;
-            let mut w: usize = 0;
-            let mut first = true;
-            tx_streams.push(build_input(dev, per, move |data, in_ch| {
-                let n = data.len() / in_ch;
-                if n == 0 {
-                    return;
-                }
-                let now = match media.wrapping_now_in_timebase(RATE as u64) {
-                    Some(v) => v,
-                    None => return,
-                };
-                let m = now.wrapping_sub(start) as isize; // media samples elapsed
-                if first {
-                    w = (m - n as isize).max(0) as usize;
-                    first = false;
-                }
-                let e = (w + n) as isize - m; // >0: we are ahead of the media clock
-                let mut n_out = n as isize;
-                if e.abs() > TX_RESYNC {
-                    w = (m - n as isize).max(0) as usize;
-                    st.tx_resyncs.fetch_add(1, Ordering::Relaxed);
-                } else if e > TX_TOL {
-                    n_out -= 1; // drop one sample
-                    st.tx_corrections.fetch_add(1, Ordering::Relaxed);
-                } else if e < -TX_TOL {
-                    n_out += 1; // repeat one sample
-                    st.tx_corrections.fetch_add(1, Ordering::Relaxed);
-                }
-                let n_out = n_out.max(1) as usize;
-                for c in 0..per {
-                    let mut peak = 0f32;
-                    for i in 0..n_out {
-                        let src = i.min(n - 1);
-                        let s = data[src * in_ch + c];
-                        peak = peak.max(s.abs());
-                        let v = (s.clamp(-1.0, 1.0) as f64 * 2147483647.0) as i32;
-                        bufs[c][(w + i) & (RING - 1)].store(v, Ordering::Relaxed);
-                    }
-                    st.tx_peaks[ch_base + c].fetch_max(peak.to_bits(), Ordering::Relaxed);
-                }
-                w += n_out;
-                st.tx_frames.fetch_add(n as u64, Ordering::Relaxed);
-            })?);
+            let mut writer = TxWriter {
+                bufs,
+                per,
+                ch_base: di * per,
+                w: 0,
+                first: true,
+                start,
+                media,
+                st: stats.clone(),
+            };
+            tx_streams.push(build_input(dev, per, move |data, in_ch| writer.push(data, in_ch))?);
+        }
+
+        let mut asio_writer: Option<TxWriter> = None;
+        if asio_shm.is_some() {
+            let mut bufs: Vec<&'static [AtomicSample]> = Vec::new();
+            for _ in 0..shm::CH {
+                let b = new_ring();
+                params.push(unsafe {
+                    ExternalBufferParameters::<Sample>::new(b.as_ptr(), RING, 1, valid.clone(), None)
+                });
+                bufs.push(b);
+            }
+            let media = make_media_clock(&server)
+                .await
+                .ok_or("media clock not available".to_string())?;
+            asio_writer = Some(TxWriter {
+                bufs,
+                per: shm::CH,
+                ch_base: 0,
+                w: 0,
+                first: true,
+                start,
+                media,
+                st: stats.clone(),
+            });
         }
 
         let (start_tx, start_rx) = tokio::sync::oneshot::channel::<Clock>();
@@ -558,6 +688,12 @@ async fn run_engine(cfg: Config, shared: Arc<Shared>, tone: bool) -> Result<(), 
             )
             .await;
         let _ = start_tx.send(start);
+
+        if let (Some(writer), Some(shm_t)) = (asio_writer, asio_shm.clone()) {
+            let sh = shared.clone();
+            let st = stats.clone();
+            asio_thread = Some(std::thread::spawn(move || asio_reader(writer, shm_t, sh, st)));
+        }
     }
 
     set_status(&shared, "Running");
@@ -567,6 +703,9 @@ async fn run_engine(cfg: Config, shared: Arc<Shared>, tone: bool) -> Result<(), 
 
     drop(rx_streams);
     drop(tx_streams);
+    if let Some(h) = asio_thread {
+        let _ = h.join();
+    }
     server.shutdown().await;
     Ok(())
 }
@@ -769,6 +908,50 @@ impl eframe::App for App {
                 // ---- meters
                 if let Some(s) = &stats {
                     ui.columns(2, |cols| {
+                        if self.cfg.use_asio {
+                            let host_on = s.asio_host.load(Ordering::Relaxed);
+                            cols[0].label(
+                                egui::RichText::new(format!(
+                                    "Dante -> ASIO inputs   frames: {}",
+                                    s.rx_frames.load(Ordering::Relaxed)
+                                ))
+                                .strong(),
+                            );
+                            cols[0].label(
+                                egui::RichText::new(if host_on {
+                                    "ASIO host connected"
+                                } else {
+                                    "no ASIO host running"
+                                })
+                                .small(),
+                            );
+                            for gi in 0..shm::CH {
+                                if gi < self.rx_disp.len() {
+                                    meter_bar(&mut cols[0], &format!("RX{}", gi + 1), self.rx_disp[gi]);
+                                }
+                            }
+                            cols[1].label(
+                                egui::RichText::new(format!(
+                                    "ASIO outputs -> Dante   frames: {}",
+                                    s.tx_frames.load(Ordering::Relaxed)
+                                ))
+                                .strong(),
+                            );
+                            cols[1].label(
+                                egui::RichText::new(format!(
+                                    "drift fixes {}   resyncs {}",
+                                    s.tx_corrections.load(Ordering::Relaxed),
+                                    s.tx_resyncs.load(Ordering::Relaxed)
+                                ))
+                                .small(),
+                            );
+                            for gi in 0..shm::CH {
+                                if gi < self.tx_disp.len() {
+                                    meter_bar(&mut cols[1], &format!("TX{}", gi + 1), self.tx_disp[gi]);
+                                }
+                            }
+                            return;
+                        }
                         cols[0].label(
                             egui::RichText::new(format!(
                                 "Dante -> Windows   frames: {}",
@@ -838,6 +1021,10 @@ impl eframe::App for App {
 
                 // ---- settings (locked while running)
                 ui.add_enabled_ui(!running, |ui| {
+                    ui.checkbox(
+                        &mut self.cfg.use_asio,
+                        "ASIO mode: use the \"Dante Bridge ASIO\" driver (4 in / 4 out) instead of VB-Matrix",
+                    );
                     egui::CollapsingHeader::new("Settings")
                         .default_open(!running)
                         .show(ui, |ui| {
