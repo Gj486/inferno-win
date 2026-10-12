@@ -27,6 +27,9 @@ jobs:
             thread_priority::set_current_thread_priority(ThreadPriority::Max)
           }
           EOF2
+          if ! grep -q '^thread-priority' inferno-src/inferno_aoip/Cargo.toml; then
+            sed -i '/^\[dependencies\]/a thread-priority = "0.16"' inferno-src/inferno_aoip/Cargo.toml
+          fi
 
       - name: Add DanteBridge
         shell: bash
@@ -53,7 +56,6 @@ jobs:
           tail -80 ../full.log > ../out/tail.txt || true
           cp target/release/dante_bridge.exe ../out/ || true
           cp ../bridge/dante_bridge.toml ../out/ || true
-          cp ../bridge/start.bat ../out/ || true
           if [ $STATUS -ne 0 ]; then
             echo "BUILD FAILED" > ../out/FAILED.txt
             echo "===== ERROR EXTRACT ====="
