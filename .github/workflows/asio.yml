@@ -7,11 +7,23 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
+
       - name: Build ASIO drivers
         shell: pwsh
         run: |
-          cmake -S asio -B asio/build -A x64
-          cmake --build asio/build --config Release 2>&1 | Tee-Object -FilePath asio/build.log
+          cmake -S asio -B asio/build -A x64 2>&1 | Tee-Object -FilePath asio/build.log
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "===== CMAKE CONFIGURE FAILED ====="
+            Get-Content asio/build.log
+            exit 1
+          }
+          cmake --build asio/build --config Release 2>&1 | Tee-Object -FilePath asio/build.log -Append
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "===== CMAKE BUILD FAILED ====="
+            Get-Content asio/build.log
+            exit 1
+          }
+
       - name: Collect
         if: always()
         shell: bash
@@ -21,8 +33,9 @@ jobs:
           cp asio/build/stageB/dante_asio.dll out/stageB/ || true
           cp asio/install.bat asio/uninstall.bat out/stageA/ || true
           cp asio/install.bat asio/uninstall.bat out/stageB/ || true
-          grep -i "error" asio/build.log | head -80 > out/errors.txt || true
-          tail -15 asio/build.log > out/tail.txt || true
+          grep -i "error" asio/build.log | head -120 > out/errors.txt || true
+          tail -60 asio/build.log > out/tail.txt || true
+
       - uses: actions/upload-artifact@v4
         if: always()
         with:
