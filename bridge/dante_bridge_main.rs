@@ -7,6 +7,10 @@
 //! NOTE: the media clock here is the local PC clock (no PTP lock to Dante).
 //! v0.4: optional ASIO mode - audio goes through the "Dante Bridge ASIO" driver
 //! (4 in / 4 out) instead of VB-Matrix, via shared memory (shm.rs).
+//!
+//! v0.5: `usrvclock` now listens to PTPv1 Sync messages from the Dante clock
+//! Leader (e.g. Yamaha QL5) on 224.0.1.129:319 and aligns Inferno's media
+//! clock with the network clock. Without this, RX/TX meters stay at -90 dB.
 
 mod shm;
 
@@ -28,6 +32,22 @@ const RATE: u32 = 48000;
 const RING: usize = 65536; // samples per TX channel ring (power of two)
 const TX_TOL: isize = 240; // 5 ms: drift tolerance before correcting
 const TX_RESYNC: isize = 4800; // 100 ms: hard resync threshold
+
+/// How long to wait for the first PTP Sync before giving up.
+/// Kept generous because a Gigabit switch may need ~10 s to flood the
+/// multicast group after the application starts.
+const MEDIA_CLOCK_TIMEOUT_S: u64 = 15;
+
+/// Human-readable hint appended to every "media clock not available" error.
+/// Appears in three places: initial `mc0` (shared start time), the WASAPI TX
+/// per-device clock, and the ASIO TX clock. All three must see the PTP
+/// overlay before the engine can start transmitting.
+const MEDIA_CLOCK_HINT: &str =
+    "media clock not available (no PTP Sync within 15 s). \
+     Check: (1) UDP port 319 open in Windows Firewall, \
+     (2) QL5 is Leader in Dante Controller, \
+     (3) the PC is on the same subnet as QL5. \
+     See dante_bridge.log for [usrvclock] lines.";
 
 // ---------------------------------------------------------------- config
 
@@ -184,6 +204,30 @@ fn describe_configs<I: Iterator<Item = cpal::SupportedStreamConfigRange>>(cfgs: 
     msg
 }
 
+/// Maximum number of F32 channels the device offers at 48 kHz.
+/// Returns 0 if the device has no F32 48 kHz config at all.
+fn max_channels_at_48k(dev: &cpal::Device, input: bool) -> usize {
+    let cfgs: Vec<cpal::SupportedStreamConfigRange> = if input {
+        dev.supported_input_configs()
+            .map(|i| i.collect())
+            .unwrap_or_default()
+    } else {
+        dev.supported_output_configs()
+            .map(|i| i.collect())
+            .unwrap_or_default()
+    };
+    let mut max = 0usize;
+    for c in &cfgs {
+        if c.sample_format() == cpal::SampleFormat::F32
+            && c.min_sample_rate().0 <= RATE
+            && c.max_sample_rate().0 >= RATE
+        {
+            max = max.max(c.channels() as usize);
+        }
+    }
+    max
+}
+
 fn build_output(
     device: &cpal::Device,
     channels: usize,
@@ -314,15 +358,29 @@ fn fill_from_pair(shared: &Arc<Mutex<Pair>>, dev: &DevStat, data: &mut [f32], ou
 
 async fn make_media_clock(server: &DeviceServer) -> Option<MediaClock> {
     let mut rx = server.get_realtime_clock_receiver();
-    for _ in 0..50 {
+    // 150 iterations × 100 ms = 15 s. The first PTP Sync may take a while
+    // after the process starts, especially on a busy Gigabit switch.
+    let iterations = MEDIA_CLOCK_TIMEOUT_S * 10;
+    for i in 0..iterations {
         rx.update();
         if let Some(ovl) = rx.get() {
             let mut mc = MediaClock::new(false);
             mc.update_overlay(*ovl);
             return Some(mc);
         }
+        if i % 10 == 0 {
+            log::info!(
+                "waiting for PTP overlay... ({}/{})",
+                i / 10,
+                MEDIA_CLOCK_TIMEOUT_S
+            );
+        }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
+    log::warn!(
+        "gave up waiting for PTP overlay after {} s",
+        MEDIA_CLOCK_TIMEOUT_S
+    );
     None
 }
 
@@ -456,7 +514,8 @@ fn engine_thread(cfg: Config, shared: Arc<Shared>, tone: bool) {
 
 async fn run_engine(cfg: Config, shared: Arc<Shared>, tone: bool) -> Result<(), String> {
     let host = cpal::default_host();
-    let per = cfg.channels_per_device.max(1);
+    let mut per = cfg.channels_per_device.max(1);
+    let configured_per = per;
 
     let mut rx_devs = Vec::new();
     for needle in &cfg.rx_devices {
@@ -472,6 +531,50 @@ async fn run_engine(cfg: Config, shared: Arc<Shared>, tone: bool) -> Result<(), 
     }
     let use_asio = cfg.use_asio;
     let tx_devs: Vec<cpal::Device> = if use_asio { Vec::new() } else { tx_devs };
+
+    // Validate channels_per_device against what each selected device actually offers.
+    // VB-Matrix devices are stereo (2 ch). Real interfaces may offer more or fewer
+    // F32 channels at 48 kHz than configured. Clamp down instead of failing, and
+    // tell the user about it in the status bar.
+    for d in &rx_devs {
+        let m = max_channels_at_48k(d, false);
+        if m == 0 {
+            return Err(format!(
+                "output device '{}' has no F32 48 kHz config at all",
+                d.name().unwrap_or_default()
+            ));
+        }
+        if m < per {
+            log::warn!(
+                "output device '{}' offers only {} ch at 48 kHz (configured {}); using {}",
+                d.name().unwrap_or_default(),
+                m,
+                per,
+                m
+            );
+            per = m;
+        }
+    }
+    for d in &tx_devs {
+        let m = max_channels_at_48k(d, true);
+        if m == 0 {
+            return Err(format!(
+                "input device '{}' has no F32 48 kHz config at all",
+                d.name().unwrap_or_default()
+            ));
+        }
+        if m < per {
+            log::warn!(
+                "input device '{}' offers only {} ch at 48 kHz (configured {}); using {}",
+                d.name().unwrap_or_default(),
+                m,
+                per,
+                m
+            );
+            per = m;
+        }
+    }
+
     let rx_total = per * rx_devs.len();
     let tx_total = per * tx_devs.len();
     let rx_dante = if use_asio { rx_total.max(shm::CH) } else { rx_total };
@@ -618,12 +721,18 @@ async fn run_engine(cfg: Config, shared: Arc<Shared>, tone: bool) -> Result<(), 
     let mut tx_streams = Vec::new();
     let mut asio_thread: Option<std::thread::JoinHandle<()>> = None;
     if tx_dante > 0 {
+        // Shared start time: reference point for all TX writers (WASAPI + ASIO).
+        // Both make_media_clock() calls below use the same PTP overlay because
+        // the underlying watch channel was already updated by usrvclock.
         let mc0 = make_media_clock(&server)
             .await
-            .ok_or("media clock not available".to_string())?;
+            .ok_or_else(|| MEDIA_CLOCK_HINT.to_string())?;
         let start: Clock = mc0
             .wrapping_now_in_timebase(RATE as u64)
-            .ok_or("media clock not ready".to_string())?;
+            .ok_or_else(|| {
+                "media clock overlay present, but wrapping_now_in_timebase returned None \
+                 (PTP timestamp looks invalid)".to_string()
+            })?;
         let valid = Arc::new(RwLock::new(true));
         let mut params: Vec<ExternalBufferParameters<Sample>> = Vec::new();
 
@@ -639,7 +748,7 @@ async fn run_engine(cfg: Config, shared: Arc<Shared>, tone: bool) -> Result<(), 
             }
             let media = make_media_clock(&server)
                 .await
-                .ok_or("media clock not available".to_string())?;
+                .ok_or_else(|| MEDIA_CLOCK_HINT.to_string())?;
             let mut writer = TxWriter {
                 bufs,
                 per,
@@ -665,7 +774,7 @@ async fn run_engine(cfg: Config, shared: Arc<Shared>, tone: bool) -> Result<(), 
             }
             let media = make_media_clock(&server)
                 .await
-                .ok_or("media clock not available".to_string())?;
+                .ok_or_else(|| MEDIA_CLOCK_HINT.to_string())?;
             asio_writer = Some(TxWriter {
                 bufs,
                 per: shm::CH,
@@ -696,7 +805,17 @@ async fn run_engine(cfg: Config, shared: Arc<Shared>, tone: bool) -> Result<(), 
         }
     }
 
-    set_status(&shared, "Running");
+    if per != configured_per {
+        set_status(
+            &shared,
+            format!(
+                "Running (channels_per_device clamped {} -> {}; check dante_bridge.log)",
+                configured_per, per
+            ),
+        );
+    } else {
+        set_status(&shared, "Running");
+    }
     while !shared.stop.load(Ordering::Relaxed) {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
@@ -868,7 +987,7 @@ impl eframe::App for App {
             egui::ScrollArea::vertical().show(ui, |ui| {
                 ui.heading("Dante Bridge");
                 ui.label(
-                    egui::RichText::new("local clock - not PTP locked")
+                    egui::RichText::new("media clock follows Dante PTP leader (QL5)")
                         .small()
                         .color(egui::Color32::GRAY),
                 );
