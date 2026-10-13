@@ -129,11 +129,9 @@ async fn ptp_loop(sender: tokio::sync::watch::Sender<Option<ClockOverlay>>) -> R
     use std::net::{Ipv4Addr, SocketAddrV4};
     use tokio::net::UdpSocket;
 
-    // PTPv1 event multicast group and port (IEEE 1588-2002).
     const PTP_EVENT_MCAST: Ipv4Addr = Ipv4Addr::new(224, 0, 1, 129);
     const PTP_EVENT_PORT: u16 = 319;
 
-    // PTPv1 message header constants.
     const MSG_TYPE_OFFSET: usize = 18;
     const MSG_SYNC: u8 = 0x00;
     const TS_SEC_OFFSET: usize = 34;
@@ -143,7 +141,7 @@ async fn ptp_loop(sender: tokio::sync::watch::Sender<Option<ClockOverlay>>) -> R
     let sock = UdpSocket::bind(bind_addr)
         .await
         .map_err(|e| format!("bind {bind_addr}: {e}"))?;
-    sock.join_multicast_v4(&PTP_EVENT_MCAST, &Ipv4Addr::UNSPECIFIED)
+    sock.join_multicast_v4(&PTP_EVENT_MCAST, Ipv4Addr::UNSPECIFIED)
         .map_err(|e| format!("join {PTP_EVENT_MCAST}: {e}"))?;
     info!("[usrvclock] PTP client listening on {PTP_EVENT_MCAST}:{PTP_EVENT_PORT}");
 
@@ -162,7 +160,6 @@ async fn ptp_loop(sender: tokio::sync::watch::Sender<Option<ClockOverlay>>) -> R
         if n < MIN_PACKET_LEN {
             continue;
         }
-        // versionPTP is the upper nibble of byte 0 (0x1X for PTPv1).
         let version_ptp = buf[0] >> 4;
         if version_ptp != 1 {
             continue;
@@ -192,8 +189,6 @@ async fn ptp_loop(sender: tokio::sync::watch::Sender<Option<ClockOverlay>>) -> R
         let shift = ptp_ns.wrapping_sub(local_ns);
 
         sync_count += 1;
-        // Log first 5 syncs, then every 100 (≈12 s at 8 sync/s), plus on
-        // any shift jump above 1 ms so real drift is always visible.
         let should_log = sync_count <= 5
             || sync_count % 100 == 0
             || last_logged_shift
