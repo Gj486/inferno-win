@@ -85,7 +85,6 @@ impl Shm {
         self.a64(Self::off(d)).store(v, Ordering::Release);
     }
 
-    /// data = interleaved frames (CH channels per frame)
     pub fn write_frames(&self, d: Dir, pos: u64, data: &[f32]) {
         let ring = self.ring(d);
         for (i, f) in data.chunks_exact(CH).enumerate() {
@@ -118,7 +117,6 @@ impl Shm {
         self.a64(OFF_DRIVER_BEAT).load(Ordering::Relaxed)
     }
 
-    /// called by the bridge when it starts
     pub fn reset(&self) {
         self.set_write_pos(Dir::In, 0);
         self.set_write_pos(Dir::Out, 0);
