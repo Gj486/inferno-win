@@ -1,10 +1,21 @@
 //! Windows replacement for usrvclock.
-//! There is no PTP daemon here: the "media clock" is the local PC clock
-//! (wall-clock time at startup + monotonic elapsed time). It is NOT locked
-//! to the Dante clock, so long recordings will drift. For testing only.
+//! Instead of a Unix-socket PTP daemon, this client listens to PTPv1 Sync
+//! messages broadcast by the Dante clock Leader (e.g. Yamaha QL5) on the
+//! multicast group 224.0.1.129:319, and uses them to align Inferno's media
+//! clock with the Dante network clock. Without this alignment, received RTP
+//! packets are timestamped against a clock that does not match Dante's, and
+//! Inferno silently discards them (all meters stay at -90 dB).
+//!
+//! PTPv1 (IEEE 1588-2002) message layout used here:
+//!   byte  0      : versionPTP << 4 | versionNetwork   (0x1X for PTPv1)
+//!   bytes 2..17  : subdomain                          ("DEFAULT" for Dante)
+//!   byte  18     : messageType                        (0x00 = Sync)
+//!   bytes 34..37 : seconds                            (big-endian u32)
+//!   bytes 38..41 : nanoseconds                        (big-endian u32)
 
 use std::{path::PathBuf, sync::OnceLock, time::{Duration, Instant, SystemTime, UNIX_EPOCH}};
 use custom_error::custom_error;
+use log::{info, warn};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ClockOverlay {
@@ -67,7 +78,6 @@ impl SafeTimestamp {
     }
 }
 
-/// On Windows the underlying clock is monotonic, so no jump guard is needed.
 pub struct SafeClock {}
 
 impl SafeClock {
@@ -88,8 +98,20 @@ pub struct AsyncClient {
 #[cfg(feature = "tokio")]
 impl AsyncClient {
     pub fn start(_path: PathBuf, _error_handler: Box<dyn FnMut(OverlayReceiveError) + Send>) -> Self {
-        let overlay = ClockOverlay { clock_id: 0, last_sync: 0, shift: 0, freq_scale: 0.0 };
-        let sender = tokio::sync::watch::Sender::new(Some(overlay));
+        let sender = tokio::sync::watch::Sender::new(None);
+        let s = sender.clone();
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                handle.spawn(async move {
+                    if let Err(e) = ptp_loop(s).await {
+                        warn!("[usrvclock] PTP loop ended: {e}");
+                    }
+                });
+            }
+            Err(_) => {
+                warn!("[usrvclock] no tokio runtime; PTP client not started");
+            }
+        }
         Self { sender }
     }
 
@@ -99,6 +121,99 @@ impl AsyncClient {
 
     pub fn subscribe(&self) -> tokio::sync::watch::Receiver<Option<ClockOverlay>> {
         self.sender.subscribe()
+    }
+}
+
+#[cfg(feature = "tokio")]
+async fn ptp_loop(sender: tokio::sync::watch::Sender<Option<ClockOverlay>>) -> Result<(), String> {
+    use std::net::{Ipv4Addr, SocketAddrV4};
+    use tokio::net::UdpSocket;
+
+    // PTPv1 event multicast group and port (IEEE 1588-2002).
+    const PTP_EVENT_MCAST: Ipv4Addr = Ipv4Addr::new(224, 0, 1, 129);
+    const PTP_EVENT_PORT: u16 = 319;
+
+    // PTPv1 message header constants.
+    const MSG_TYPE_OFFSET: usize = 18;
+    const MSG_SYNC: u8 = 0x00;
+    const TS_SEC_OFFSET: usize = 34;
+    const MIN_PACKET_LEN: usize = 42;
+
+    let bind_addr = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, PTP_EVENT_PORT);
+    let sock = UdpSocket::bind(bind_addr)
+        .await
+        .map_err(|e| format!("bind {bind_addr}: {e}"))?;
+    sock.join_multicast_v4(&PTP_EVENT_MCAST, &Ipv4Addr::UNSPECIFIED)
+        .map_err(|e| format!("join {PTP_EVENT_MCAST}: {e}"))?;
+    info!("[usrvclock] PTP client listening on {PTP_EVENT_MCAST}:{PTP_EVENT_PORT}");
+
+    let mut buf = [0u8; 4096];
+    let mut last_logged_shift: Option<i64> = None;
+    let mut sync_count: u64 = 0;
+
+    loop {
+        let (n, from) = match sock.recv_from(&mut buf).await {
+            Ok(x) => x,
+            Err(e) => {
+                warn!("[usrvclock] PTP recv error: {e}");
+                continue;
+            }
+        };
+        if n < MIN_PACKET_LEN {
+            continue;
+        }
+        // versionPTP is the upper nibble of byte 0 (0x1X for PTPv1).
+        let version_ptp = buf[0] >> 4;
+        if version_ptp != 1 {
+            continue;
+        }
+        if buf[MSG_TYPE_OFFSET] != MSG_SYNC {
+            continue;
+        }
+
+        let sec = u32::from_be_bytes([
+            buf[TS_SEC_OFFSET],
+            buf[TS_SEC_OFFSET + 1],
+            buf[TS_SEC_OFFSET + 2],
+            buf[TS_SEC_OFFSET + 3],
+        ]);
+        let nsec = u32::from_be_bytes([
+            buf[TS_SEC_OFFSET + 4],
+            buf[TS_SEC_OFFSET + 5],
+            buf[TS_SEC_OFFSET + 6],
+            buf[TS_SEC_OFFSET + 7],
+        ]);
+        if sec == 0 && nsec == 0 {
+            continue;
+        }
+
+        let ptp_ns = (sec as i64) * 1_000_000_000i64 + (nsec as i64);
+        let local_ns = local_now_ns();
+        let shift = ptp_ns.wrapping_sub(local_ns);
+
+        sync_count += 1;
+        // Log first 5 syncs, then every 100 (≈12 s at 8 sync/s), plus on
+        // any shift jump above 1 ms so real drift is always visible.
+        let should_log = sync_count <= 5
+            || sync_count % 100 == 0
+            || last_logged_shift
+                .map(|l| (l - shift).abs() > 1_000_000)
+                .unwrap_or(true);
+        if should_log {
+            info!(
+                "[usrvclock] PTP sync #{sync_count} from {from}: ptp={ptp_ns} local={local_ns} shift={}us",
+                shift / 1000
+            );
+            last_logged_shift = Some(shift);
+        }
+
+        let overlay = ClockOverlay {
+            clock_id: 0,
+            last_sync: local_ns,
+            shift,
+            freq_scale: 0.0,
+        };
+        let _ = sender.send(Some(overlay));
     }
 }
 
