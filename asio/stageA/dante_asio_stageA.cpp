@@ -95,7 +95,7 @@ static const double kRate = 48000.0;
 static const long kMinBuf = 64, kMaxBuf = 2048, kPrefBuf = 512;
 
 // Test tone frequencies, one per output channel (Hz).
-static const double kToneHz[kOutputs] = {1000.0, 2000.0, 3000.0, 4000.0};
+static const double kToneHz[kInputs] = {1000.0, 2000.0, 3000.0, 4000.0};
 // Peak amplitude (-20 dBFS): audible but far from clipping.
 static const double kToneAmp = 0.1;
 
@@ -235,10 +235,10 @@ public:
             if (b.isInput == info->isInput && b.channelNum == info->channel) info->isActive = ASIOTrue;
         }
         if (info->isInput) {
-            std::snprintf(info->name, sizeof(info->name), "Test In %d (silence)", (int)info->channel + 1);
-        } else {
             std::snprintf(info->name, sizeof(info->name), "Test Tone %d (%.0f Hz)",
                           (int)info->channel + 1, kToneHz[info->channel]);
+        } else {
+            std::snprintf(info->name, sizeof(info->name), "Test Out %d (unused)", (int)info->channel + 1);
         }
         return ASE_OK;
     }
@@ -304,15 +304,13 @@ private:
                 else YieldProcessor();
             }
 
-            // Fill every channel buffer: inputs = silence, outputs = test tone.
+            // Inputs = test tones (this is what Open Sound Meter / Smaart record).
+            // Output buffers belong to the host, so they are left alone.
             for (size_t k = 0; k < buffers_.size(); k++) {
+                if (!buffers_[k].isInput) continue;
                 int ch = (int)buffers_[k].channelNum;
                 int32_t* dst = (int32_t*)buffers_[k].buffers[idx];
-                if (buffers_[k].isInput) {
-                    std::memset(dst, 0, (size_t)buffer_size_ * sizeof(int32_t));
-                    continue;
-                }
-                if (ch < 0 || ch >= kOutputs) {
+                if (ch < 0 || ch >= kInputs) {
                     std::memset(dst, 0, (size_t)buffer_size_ * sizeof(int32_t));
                     continue;
                 }
@@ -320,8 +318,7 @@ private:
                 const double two_pi_f_over_fs = 2.0 * 3.14159265358979323846 * f / kRate;
                 for (long i = 0; i < buffer_size_; i++) {
                     double phase = two_pi_f_over_fs * (double)(sample_index_ + (uint64_t)i);
-                    double s = kToneAmp * std::sin(phase);
-                    dst[i] = (int32_t)(s * 2147483647.0);
+                    dst[i] = (int32_t)(kToneAmp * std::sin(phase) * 2147483647.0);
                 }
             }
             sample_index_ += (uint64_t)buffer_size_;
