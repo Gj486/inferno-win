@@ -14,6 +14,7 @@
 #define NOMINMAX
 #include <windows.h>
 #include <objbase.h>
+#include <olectl.h>  // SELFREG_E_CLASS
 #include <mmsystem.h>
 
 #include <atomic>
@@ -387,6 +388,13 @@ private:
 
 // ------------------------------------------------------------ DLL exports
 
+// The Windows SDK already declares these four functions (without dllexport), so they are
+// exported by name through the linker instead of __declspec(dllexport).
+#pragma comment(linker, "/EXPORT:DllGetClassObject,PRIVATE")
+#pragma comment(linker, "/EXPORT:DllCanUnloadNow,PRIVATE")
+#pragma comment(linker, "/EXPORT:DllRegisterServer,PRIVATE")
+#pragma comment(linker, "/EXPORT:DllUnregisterServer,PRIVATE")
+
 BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID) {
     if (reason == DLL_PROCESS_ATTACH) {
         g_module = module;
@@ -395,7 +403,7 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID) {
     return TRUE;
 }
 
-extern "C" __declspec(dllexport) HRESULT STDAPICALLTYPE DllGetClassObject(REFCLSID rclsid, REFIID riid, LPVOID* ppv) {
+extern "C" HRESULT STDAPICALLTYPE DllGetClassObject(REFCLSID rclsid, REFIID riid, LPVOID* ppv) {
     if (!ppv) return E_POINTER;
     *ppv = nullptr;
     if (!IsEqualCLSID(rclsid, CLSID_DanteBridgeAsio)) return CLASS_E_CLASSNOTAVAILABLE;
@@ -405,7 +413,7 @@ extern "C" __declspec(dllexport) HRESULT STDAPICALLTYPE DllGetClassObject(REFCLS
     return hr;
 }
 
-extern "C" __declspec(dllexport) HRESULT STDAPICALLTYPE DllCanUnloadNow() {
+extern "C" HRESULT STDAPICALLTYPE DllCanUnloadNow() {
     return g_objects.load() == 0 ? S_OK : S_FALSE;
 }
 
@@ -418,7 +426,7 @@ static bool setValue(const char* subkey, const char* name, const char* value) {
     return r == ERROR_SUCCESS;
 }
 
-extern "C" __declspec(dllexport) HRESULT STDAPICALLTYPE DllRegisterServer() {
+extern "C" HRESULT STDAPICALLTYPE DllRegisterServer() {
     char path[MAX_PATH];
     if (!GetModuleFileNameA(g_module, path, MAX_PATH)) return E_FAIL;
 
@@ -435,7 +443,7 @@ extern "C" __declspec(dllexport) HRESULT STDAPICALLTYPE DllRegisterServer() {
     return ok ? S_OK : SELFREG_E_CLASS;
 }
 
-extern "C" __declspec(dllexport) HRESULT STDAPICALLTYPE DllUnregisterServer() {
+extern "C" HRESULT STDAPICALLTYPE DllUnregisterServer() {
     char key[256];
     std::snprintf(key, sizeof(key), "SOFTWARE\\Classes\\CLSID\\%s", kClsidString);
     RegDeleteTreeA(HKEY_LOCAL_MACHINE, key);
