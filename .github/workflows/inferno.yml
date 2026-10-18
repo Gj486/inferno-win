@@ -54,6 +54,7 @@ jobs:
           set -e
           grep -A14 "^error" ../full.log | head -300 > ../out/errors.txt || true
           tail -80 ../full.log > ../out/tail.txt || true
+          { for f in searchfire/src/socket.rs searchfire/src/discovery.rs inferno_aoip/src/mdns_client.rs; do echo "===== $f ====="; cat $f; done; } > ../out/sources5.txt || true
           cp target/release/dante_bridge.exe ../out/ || true
           cp ../bridge/dante_bridge.toml ../out/ || true
           if [ $STATUS -ne 0 ]; then
