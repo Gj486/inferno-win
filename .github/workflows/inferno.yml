@@ -27,6 +27,8 @@ jobs:
             thread_priority::set_current_thread_priority(ThreadPriority::Max)
           }
           EOF2
+          perl -0pi -e 's/IpAddr::V4\(if cfg!\(windows\) && ifaces\.len\(\) == 1 \{\s*\*ifaces\.iter\(\)\.next\(\)\.unwrap\(\)\s*\} else \{\s*Ipv4Addr::UNSPECIFIED\s*\}\)/IpAddr::V4(Ipv4Addr::UNSPECIFIED)/' inferno-src/searchfire/src/socket.rs
+          grep -n "IpAddr::V4(Ipv4Addr::UNSPECIFIED)" inferno-src/searchfire/src/socket.rs || (echo "mDNS PATCH FAILED"; exit 1)
           if ! grep -q '^thread-priority' inferno-src/inferno_aoip/Cargo.toml; then
             sed -i '/^\[dependencies\]/a thread-priority = "0.16"' inferno-src/inferno_aoip/Cargo.toml
           fi
