@@ -651,6 +651,10 @@ async fn run_engine(cfg: Config, shared: Arc<Shared>, tone: bool) -> Result<(), 
         })?);
     }
 
+    // the PTP clock client (usrvclock) must join the multicast group on the Dante adapter
+    if !cfg.bind_ip.trim().is_empty() {
+        std::env::set_var("INFERNO_BIND_IP", cfg.bind_ip.trim());
+    }
     let mut server = DeviceServer::start(settings).await;
 
     if rx_dante > 0 {
