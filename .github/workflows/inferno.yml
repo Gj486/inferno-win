@@ -27,6 +27,7 @@ jobs:
             thread_priority::set_current_thread_priority(ThreadPriority::Max)
           }
           EOF2
+          # mDNS: Windows only delivers multicast replies to a socket bound to 0.0.0.0
           perl -0pi -e 's/IpAddr::V4\(if cfg!\(windows\) && ifaces\.len\(\) == 1 \{\s*\*ifaces\.iter\(\)\.next\(\)\.unwrap\(\)\s*\} else \{\s*Ipv4Addr::UNSPECIFIED\s*\}\)/IpAddr::V4(Ipv4Addr::UNSPECIFIED)/' inferno-src/searchfire/src/socket.rs
           grep -n "IpAddr::V4(Ipv4Addr::UNSPECIFIED)" inferno-src/searchfire/src/socket.rs || (echo "mDNS PATCH FAILED"; exit 1)
           if ! grep -q '^thread-priority' inferno-src/inferno_aoip/Cargo.toml; then
@@ -40,10 +41,17 @@ jobs:
           mkdir -p inferno-src/dante_bridge/src
           cp bridge/dante_bridge_Cargo.toml inferno-src/dante_bridge/Cargo.toml
           cp bridge/dante_bridge_main.rs inferno-src/dante_bridge/src/main.rs
-          cp bridge/dante_bridge.toml inferno-src/dante_bridge/src/dante_bridge.toml
           cp bridge/shm.rs inferno-src/dante_bridge/src/shm.rs
           sed -i 's/"inferno2pipe",/"inferno2pipe",\n    "dante_bridge",/' inferno-src/Cargo.toml
           sed -i '/"alsa_pcm_inferno",/d' inferno-src/Cargo.toml
+
+      - name: Unit tests (do not block the build)
+        continue-on-error: true
+        shell: bash
+        working-directory: inferno-src
+        run: |
+          mkdir -p ../out
+          cargo test -p usrvclock 2>&1 | tail -60 | tee ../out/tests.txt
 
       - name: Build
         shell: bash
@@ -51,14 +59,13 @@ jobs:
         run: |
           mkdir -p ../out
           set +e
-          cargo build --release -p inferno2pipe -p dante_bridge > ../full.log 2>&1
+          cargo build --release -p dante_bridge > ../full.log 2>&1
           STATUS=$?
           set -e
           grep -A14 "^error" ../full.log | head -300 > ../out/errors.txt || true
           tail -80 ../full.log > ../out/tail.txt || true
-          { for f in searchfire/src/socket.rs searchfire/src/discovery.rs inferno_aoip/src/mdns_client.rs; do echo "===== $f ====="; cat $f; done; } > ../out/sources5.txt || true
           cp target/release/dante_bridge.exe ../out/ || true
-          cp ../bridge/dante_bridge.toml ../out/ || true
+          cp ../bridge/firewall.bat ../out/ || true
           if [ $STATUS -ne 0 ]; then
             echo "BUILD FAILED" > ../out/FAILED.txt
             echo "===== ERROR EXTRACT ====="
