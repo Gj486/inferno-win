@@ -24,7 +24,8 @@ use std::time::{Duration, Instant};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use eframe::egui;
 use inferno_aoip::device_server::{
-    AtomicSample, Clock, DeviceServer, ExternalBufferParameters, MediaClock, Sample, Settings,
+    AtomicSample, Clock, DeviceServer, ExternalBufferParameters, MediaClock, RealTimeClockReceiver,
+    Sample, Settings,
 };
 use serde::{Deserialize, Serialize};
 
@@ -116,6 +117,8 @@ struct Stats {
     tx_peaks: Vec<AtomicU32>,
     rx_dev: Vec<DevStat>,
     asio_host: AtomicBool,
+    /// milliseconds since the PTP clock overlay last changed (u64::MAX = never)
+    ptp_age_ms: AtomicU64,
 }
 
 impl Stats {
@@ -128,6 +131,7 @@ impl Stats {
             rx_peaks: (0..rx_ch).map(|_| AtomicU32::new(0)).collect(),
             tx_peaks: (0..tx_ch).map(|_| AtomicU32::new(0)).collect(),
             asio_host: AtomicBool::new(false),
+            ptp_age_ms: AtomicU64::new(u64::MAX),
             rx_dev: (0..rx_devs)
                 .map(|_| DevStat {
                     buf_frames: AtomicU64::new(0),
@@ -353,15 +357,22 @@ fn fill_from_pair(shared: &Arc<Mutex<Pair>>, dev: &DevStat, data: &mut [f32], ou
 
 // ---------------------------------------------------------------- clock helper
 
-async fn make_media_clock(server: &DeviceServer) -> Option<MediaClock> {
+/// Waits for the first PTP overlay. Returns a MediaClock plus the receiver that keeps
+/// delivering newer overlays (the clock must be refreshed, because the Dante clock
+/// drifts against the PC clock by tens of microseconds per second).
+async fn make_media_clock(server: &DeviceServer) -> Option<(MediaClock, RealTimeClockReceiver)> {
     let mut rx = server.get_realtime_clock_receiver();
     let iterations = MEDIA_CLOCK_TIMEOUT_S * 10;
     for i in 0..iterations {
         rx.update();
+        let mut found = None;
         if let Some(ovl) = rx.get() {
+            found = Some(*ovl);
+        }
+        if let Some(o) = found {
             let mut mc = MediaClock::new(false);
-            mc.update_overlay(*ovl);
-            return Some(mc);
+            mc.update_overlay(o);
+            return Some((mc, rx));
         }
         if i % 10 == 0 {
             log::info!(
@@ -379,6 +390,7 @@ async fn make_media_clock(server: &DeviceServer) -> Option<MediaClock> {
     None
 }
 
+/// One TX ring (RING samples of silence). Leaked on purpose: Inferno keeps raw pointers to it.
 fn new_ring() -> &'static [AtomicSample] {
     let v: Vec<AtomicSample> = (0..RING).map(|_| AtomicSample::new(0)).collect();
     Box::leak(v.into_boxed_slice())
@@ -394,6 +406,7 @@ struct TxWriter {
     first: bool,
     start: Clock,
     media: MediaClock,
+    clock_rx: RealTimeClockReceiver,
     st: Arc<Stats>,
 }
 
@@ -402,6 +415,11 @@ impl TxWriter {
         let n = data.len() / in_ch;
         if n == 0 {
             return;
+        }
+        // keep following the Dante clock (see make_media_clock)
+        self.clock_rx.update();
+        if let Some(o) = self.clock_rx.get() {
+            self.media.update_overlay(*o);
         }
         let now = match self.media.wrapping_now_in_timebase(RATE as u64) {
             Some(v) => v,
@@ -709,7 +727,7 @@ async fn run_engine(cfg: Config, shared: Arc<Shared>, tone: bool) -> Result<(), 
     let mut tx_streams = Vec::new();
     let mut asio_thread: Option<std::thread::JoinHandle<()>> = None;
     if tx_dante > 0 {
-        let mc0 = make_media_clock(&server)
+        let (mc0, _) = make_media_clock(&server)
             .await
             .ok_or_else(|| MEDIA_CLOCK_HINT.to_string())?;
         let start: Clock = mc0
@@ -730,7 +748,7 @@ async fn run_engine(cfg: Config, shared: Arc<Shared>, tone: bool) -> Result<(), 
                 });
                 bufs.push(b);
             }
-            let media = make_media_clock(&server)
+            let (media, clock_rx) = make_media_clock(&server)
                 .await
                 .ok_or_else(|| MEDIA_CLOCK_HINT.to_string())?;
             let mut writer = TxWriter {
@@ -741,6 +759,7 @@ async fn run_engine(cfg: Config, shared: Arc<Shared>, tone: bool) -> Result<(), 
                 first: true,
                 start,
                 media,
+                clock_rx,
                 st: stats.clone(),
             };
             tx_streams.push(build_input(dev, per, move |data, in_ch| writer.push(data, in_ch))?);
@@ -756,7 +775,7 @@ async fn run_engine(cfg: Config, shared: Arc<Shared>, tone: bool) -> Result<(), 
                 });
                 bufs.push(b);
             }
-            let media = make_media_clock(&server)
+            let (media, clock_rx) = make_media_clock(&server)
                 .await
                 .ok_or_else(|| MEDIA_CLOCK_HINT.to_string())?;
             asio_writer = Some(TxWriter {
@@ -767,6 +786,7 @@ async fn run_engine(cfg: Config, shared: Arc<Shared>, tone: bool) -> Result<(), 
                 first: true,
                 start,
                 media,
+                clock_rx,
                 st: stats.clone(),
             });
         }
@@ -800,8 +820,20 @@ async fn run_engine(cfg: Config, shared: Arc<Shared>, tone: bool) -> Result<(), 
     } else {
         set_status(&shared, "Running");
     }
+    // watch the PTP clock so the window can show whether we still follow the Dante clock
+    let mut clk_rx = server.get_realtime_clock_receiver();
+    let mut last_sync_seen: Option<i64> = None;
+    let mut last_change = Instant::now();
     while !shared.stop.load(Ordering::Relaxed) {
         tokio::time::sleep(Duration::from_millis(100)).await;
+        clk_rx.update();
+        if let Some(o) = clk_rx.get() {
+            if last_sync_seen != Some(o.last_sync) {
+                last_sync_seen = Some(o.last_sync);
+                last_change = Instant::now();
+            }
+        }
+        stats.ptp_age_ms.store(last_change.elapsed().as_millis() as u64, Ordering::Relaxed);
     }
 
     drop(rx_streams);
@@ -1001,6 +1033,20 @@ impl eframe::App for App {
                     egui::Color32::GRAY
                 };
                 ui.label(egui::RichText::new(format!("Status: {status}")).color(status_color));
+                if let Some(s) = &stats {
+                    let age = s.ptp_age_ms.load(Ordering::Relaxed);
+                    let (text, color) = if age == u64::MAX {
+                        ("PTP clock: waiting for the first Sync...".to_string(), egui::Color32::YELLOW)
+                    } else if age < 2000 {
+                        ("PTP clock: following the Dante clock".to_string(), egui::Color32::from_rgb(70, 200, 90))
+                    } else {
+                        (
+                            format!("PTP clock: NO Sync for {} s (check cable, firewall, clock Leader)", age / 1000),
+                            egui::Color32::from_rgb(220, 60, 60),
+                        )
+                    };
+                    ui.label(egui::RichText::new(text).color(color));
+                }
                 if !self.note.is_empty() {
                     ui.label(egui::RichText::new(self.note.clone()).color(egui::Color32::YELLOW));
                 }
@@ -1248,7 +1294,8 @@ fn main() -> eframe::Result<()> {
 
     {
         let mut b = env_logger::Builder::new();
-        b.parse_filters(&cfg.log_level);
+        // cmc_server logs 'unknown opcode 0x3010' (a QL5 status message) as ERROR every ~10 s
+        b.parse_filters(&format!("{},inferno_aoip::device_server::cmc_server=off", cfg.log_level));
         if let Ok(f) = std::fs::File::create(exe_dir().join("dante_bridge.log")) {
             b.target(env_logger::Target::Pipe(Box::new(f)));
         }
