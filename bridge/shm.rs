@@ -14,6 +14,19 @@ const HEADER: usize = 128;
 const RING_BYTES: usize = FRAMES * CH * 4;
 const TOTAL: usize = HEADER + 2 * RING_BYTES;
 
+/// Version of the header layout written by the bridge (the driver ignores it, the bridge checks the driver).
+pub const LAYOUT_VERSION: u32 = 2;
+/// Version number the ASIO driver must report in the header (see dante_asio.cpp).
+pub const DRIVER_VERSION: u32 = 2;
+/// Header flag: the driver uses smooth (resampling) drift compensation on its input path.
+pub const FLAG_RX_SMOOTH: u32 = 1;
+
+const OFF_LAYOUT: usize = 0; // u32, written by the bridge
+const OFF_FLAGS: usize = 4; // u32, written by the bridge
+const OFF_DRIVER_VER: usize = 8; // u32, written by the driver
+const OFF_IN_UNDERRUNS: usize = 56; // u64, written by the driver
+const OFF_IN_LEAD: usize = 64; // i64 (frames), written by the driver
+const OFF_IN_PPM: usize = 72; // i64, written by the driver
 const OFF_IN_W: usize = 16;
 const OFF_OUT_W: usize = 24;
 const OFF_BRIDGE_BEAT: usize = 32;
@@ -66,6 +79,10 @@ impl Shm {
         unsafe { &*(self.base.add(off) as *const AtomicU64) }
     }
 
+    fn a32(&self, off: usize) -> &AtomicU32 {
+        unsafe { &*(self.base.add(off) as *const AtomicU32) }
+    }
+
     fn ring(&self, d: Dir) -> *const AtomicU32 {
         unsafe { self.base.add(HEADER + (d as usize) * RING_BYTES) as *const AtomicU32 }
     }
@@ -85,6 +102,7 @@ impl Shm {
         self.a64(Self::off(d)).store(v, Ordering::Release);
     }
 
+    /// data = interleaved frames (CH channels per frame)
     pub fn write_frames(&self, d: Dir, pos: u64, data: &[f32]) {
         let ring = self.ring(d);
         for (i, f) in data.chunks_exact(CH).enumerate() {
@@ -115,6 +133,30 @@ impl Shm {
 
     pub fn driver_beat(&self) -> u64 {
         self.a64(OFF_DRIVER_BEAT).load(Ordering::Relaxed)
+    }
+
+    /// called by the bridge when it starts
+    /// Called by the bridge at start: layout version, feature flags, and zeroed driver metrics.
+    pub fn init_layout(&self, flags: u32) {
+        self.a32(OFF_LAYOUT).store(LAYOUT_VERSION, Ordering::Relaxed);
+        self.a32(OFF_FLAGS).store(flags, Ordering::Relaxed);
+        self.a64(OFF_IN_UNDERRUNS).store(0, Ordering::Relaxed);
+        self.a64(OFF_IN_LEAD).store(0, Ordering::Relaxed);
+        self.a64(OFF_IN_PPM).store(0, Ordering::Relaxed);
+    }
+
+    /// Version reported by the driver (0 = old driver that does not report one).
+    pub fn driver_version(&self) -> u32 {
+        self.a32(OFF_DRIVER_VER).load(Ordering::Relaxed)
+    }
+
+    /// (underruns, queue lead in frames vs target, rate adjustment in ppm) as reported by the driver.
+    pub fn rx_metrics(&self) -> (u64, i64, i64) {
+        (
+            self.a64(OFF_IN_UNDERRUNS).load(Ordering::Relaxed),
+            self.a64(OFF_IN_LEAD).load(Ordering::Relaxed) as i64,
+            self.a64(OFF_IN_PPM).load(Ordering::Relaxed) as i64,
+        )
     }
 
     pub fn reset(&self) {
