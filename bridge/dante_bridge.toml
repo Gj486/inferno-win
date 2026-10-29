@@ -5,15 +5,13 @@ device_name = "DanteBridge"
 
 # IPv4 address of the Ethernet adapter connected to Dante (see ipconfig).
 # Leave empty to let the program choose (not recommended).
-bind_ip = "169.254.58.19"
+bind_ip = ""
 
 # 0 = standard Dante ports. Use 14400 if another program (e.g. Dante
 # Virtual Soundcard / conmon_cmm_service) already uses ports 8700/8800.
 alt_port = 14400
 
-# Channels carried by EACH Windows audio device.
-# VB-Matrix (VB-Audio Matrix) presents stereo devices only -> keep this at 2.
-# The app clamps down automatically if the device offers fewer channels.
+# Channels carried by each Windows audio device (VB-Matrix devices are stereo).
 channels_per_device = 2
 
 # Dante -> Windows. Windows OUTPUT devices (name contains, case-insensitive).
@@ -31,9 +29,14 @@ buffer_ms = 100
 tx_latency_ms = 40
 
 # Log file dante_bridge.log next to the exe: error, warn, info, debug
-# Use "debug" while diagnosing PTP problems so [usrvclock] lines appear.
-log_level = "debug"
+log_level = "info"
 
-# v0.4: set to true to route audio through the "Dante Bridge ASIO"
-# driver (4 in / 4 out) instead of VB-Matrix.
-use_asio = false
+# ---- performance / drift options (change ONE at a time when testing) ----
+# Ask Windows for 1 ms timer ticks and a high priority class (true/false).
+perf_boost = true
+
+# Windows -> Dante drift compensation: "smooth" (resampling, default) or "legacy" (drop/repeat 1 sample).
+tx_drift_mode = "smooth"
+
+# Dante -> ASIO inputs drift compensation (done inside the ASIO driver): "smooth" or "legacy".
+rx_drift_mode = "smooth"
