@@ -18,6 +18,7 @@
 #include <mmsystem.h>
 
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -105,7 +106,7 @@ constexpr size_t FRAMES = 32768;  // frames per ring, power of two
 constexpr size_t HEADER = 128;
 constexpr size_t RING_BYTES = FRAMES * CH * 4;
 constexpr size_t TOTAL = HEADER + 2 * RING_BYTES;
-constexpr size_t OFF_IN_W = 16, OFF_OUT_W = 24, OFF_DRIVER_BEAT = 40;
+constexpr size_t OFF_IN_W = 16, OFF_OUT_W = 24, OFF_BRIDGE_BEAT = 32, OFF_DRIVER_BEAT = 40;
 constexpr size_t OFF_FLAGS = 4, OFF_DRIVER_VER = 8, OFF_IN_UNDERRUNS = 56, OFF_IN_LEAD = 64, OFF_IN_PPM = 72;
 constexpr uint32_t DRIVER_VERSION = 2;   // must match shm.rs DRIVER_VERSION
 constexpr uint32_t FLAG_RX_SMOOTH = 1;   // header flag set by the bridge
@@ -172,6 +173,7 @@ public:
         a64(OFF_IN_LEAD)->store((uint64_t)lead, std::memory_order_relaxed);
         a64(OFF_IN_PPM)->store((uint64_t)ppm, std::memory_order_relaxed);
     }
+    uint64_t bridge_beat() const { return a64(OFF_BRIDGE_BEAT)->load(std::memory_order_relaxed); }
     void bump_driver_beat() { a64(OFF_DRIVER_BEAT)->fetch_add(1, std::memory_order_relaxed); }
 
     // data: interleaved frames (CH floats per frame)
@@ -390,6 +392,17 @@ private:
     // Reads one block (n frames) of Dante audio from the shared ring.
     // Keeps ~20 ms in the queue; corrects clock drift by dropping/repeating one sample.
     void readInput(size_t n, float* out) {
+        if (map_.ok()) {
+            // If the bridge is not writing (stopped, crashed, not started) the write position does not
+            // move. Never replay the old tail of the ring in that case: output silence.
+            const uint64_t wp = map_.write_pos(shm::In);
+            if (wp == in_last_wp_) {
+                std::fill(out, out + n * shm::CH, 0.f);
+                in_started_ = false;
+                return;
+            }
+            in_last_wp_ = wp;
+        }
         if (map_.ok() && (map_.flags() & shm::FLAG_RX_SMOOTH) != 0) {
             readInputSmooth(n, out);
         } else {
@@ -486,6 +499,11 @@ private:
         std::vector<float> inblk((size_t)buffer_size_ * shm::CH, 0.f), outblk((size_t)buffer_size_ * shm::CH, 0.f);
         uint64_t out_wp = map_.ok() ? map_.write_pos(shm::Out) : 0;
         in_started_ = false;
+        in_last_wp_ = map_.ok() ? map_.write_pos(shm::In) : 0;
+        // The bridge is considered NOT running until its heartbeat is seen moving. Without this the
+        // driver would replay the last (stale) audio left in the shared file by a previous session.
+        last_bridge_beat_ = map_.ok() ? map_.bridge_beat() : 0;
+        last_bridge_change_ = std::chrono::steady_clock::now() - std::chrono::seconds(1);
         long idx = 0;
         uint64_t n = 0;
 
@@ -503,7 +521,20 @@ private:
             }
 
             // inputs: Dante -> ASIO (shared memory written by DanteBridge.exe)
-            readInput((size_t)buffer_size_, inblk.data());
+            const uint64_t bridge_beat = map_.ok() ? map_.bridge_beat() : 0;
+            const auto now_tp = std::chrono::steady_clock::now();
+            if (bridge_beat != last_bridge_beat_) {
+                last_bridge_beat_ = bridge_beat;
+                last_bridge_change_ = now_tp;
+            }
+            const bool bridge_alive =
+                map_.ok() && (now_tp - last_bridge_change_) < std::chrono::milliseconds(500);
+            if (bridge_alive) {
+                readInput((size_t)buffer_size_, inblk.data());
+            } else {
+                std::fill(inblk.begin(), inblk.end(), 0.f);  // bridge stopped: silence
+                in_started_ = false;
+            }
             for (size_t k = 0; k < buffers_.size(); k++) {
                 if (!buffers_[k].isInput) continue;
                 int ch = (int)buffers_[k].channelNum;
@@ -555,6 +586,9 @@ private:
     std::atomic<uint64_t> stamp_ns_{0};
     shm::Mapping map_;
     uint64_t in_rd_ = 0;
+    uint64_t in_last_wp_ = 0;  // write position seen on the previous block (detects a stopped bridge)
+    uint64_t last_bridge_beat_ = 0;
+    std::chrono::steady_clock::time_point last_bridge_change_{};
     double in_frac_ = 0.0;
     double in_ema_ = 0.0;
     uint64_t in_underruns_ = 0;
