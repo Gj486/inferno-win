@@ -106,6 +106,9 @@ constexpr size_t HEADER = 128;
 constexpr size_t RING_BYTES = FRAMES * CH * 4;
 constexpr size_t TOTAL = HEADER + 2 * RING_BYTES;
 constexpr size_t OFF_IN_W = 16, OFF_OUT_W = 24, OFF_DRIVER_BEAT = 40;
+constexpr size_t OFF_FLAGS = 4, OFF_DRIVER_VER = 8, OFF_IN_UNDERRUNS = 56, OFF_IN_LEAD = 64, OFF_IN_PPM = 72;
+constexpr uint32_t DRIVER_VERSION = 2;   // must match shm.rs DRIVER_VERSION
+constexpr uint32_t FLAG_RX_SMOOTH = 1;   // header flag set by the bridge
 enum Dir { In = 0, Out = 1 };
 
 class Mapping {
@@ -145,6 +148,7 @@ public:
             close();
             return false;
         }
+        set_driver_version(DRIVER_VERSION);
         return true;
     }
 
@@ -161,6 +165,13 @@ public:
 
     uint64_t write_pos(Dir d) const { return a64(d == In ? OFF_IN_W : OFF_OUT_W)->load(std::memory_order_acquire); }
     void set_write_pos(Dir d, uint64_t v) { a64(d == In ? OFF_IN_W : OFF_OUT_W)->store(v, std::memory_order_release); }
+    uint32_t flags() const { return a32(OFF_FLAGS)->load(std::memory_order_relaxed); }
+    void set_driver_version(uint32_t v) { a32(OFF_DRIVER_VER)->store(v, std::memory_order_relaxed); }
+    void set_in_metrics(uint64_t underruns, int64_t lead, int64_t ppm) {
+        a64(OFF_IN_UNDERRUNS)->store(underruns, std::memory_order_relaxed);
+        a64(OFF_IN_LEAD)->store((uint64_t)lead, std::memory_order_relaxed);
+        a64(OFF_IN_PPM)->store((uint64_t)ppm, std::memory_order_relaxed);
+    }
     void bump_driver_beat() { a64(OFF_DRIVER_BEAT)->fetch_add(1, std::memory_order_relaxed); }
 
     // data: interleaved frames (CH floats per frame)
@@ -188,6 +199,7 @@ public:
     }
 
 private:
+    std::atomic<uint32_t>* a32(size_t off) const { return reinterpret_cast<std::atomic<uint32_t>*>(base_ + off); }
     std::atomic<uint64_t>* a64(size_t off) const { return reinterpret_cast<std::atomic<uint64_t>*>(base_ + off); }
     std::atomic<uint32_t>* ring_(Dir d) const {
         return reinterpret_cast<std::atomic<uint32_t>*>(base_ + HEADER + (size_t)d * RING_BYTES);
@@ -378,6 +390,62 @@ private:
     // Reads one block (n frames) of Dante audio from the shared ring.
     // Keeps ~20 ms in the queue; corrects clock drift by dropping/repeating one sample.
     void readInput(size_t n, float* out) {
+        if (map_.ok() && (map_.flags() & shm::FLAG_RX_SMOOTH) != 0) {
+            readInputSmooth(n, out);
+        } else {
+            readInputLegacy(n, out);
+        }
+    }
+
+    // Smooth version: the queue lead is low-pass filtered and corrected by a tiny, continuous
+    // change of the read speed (linear interpolation, at most +-1000 ppm). No sample is dropped.
+    void readInputSmooth(size_t n, float* out) {
+        const size_t total = n * shm::CH;
+        const uint64_t wp = map_.write_pos(shm::In);
+        const int64_t target = std::max<int64_t>(2 * (int64_t)n, 960);
+        int64_t avail = (int64_t)(wp - in_rd_);
+        if (!in_started_ || avail < 0 || avail > target * 4) {
+            in_rd_ = wp > (uint64_t)target ? wp - (uint64_t)target : 0;
+            in_frac_ = 0.0;
+            in_ema_ = 0.0;
+            in_started_ = true;
+            avail = (int64_t)(wp - in_rd_);
+        }
+        // positive lead = more audio queued than needed -> read slightly faster
+        const double alpha = std::min(1.0, (double)n / ((double)kRate * 0.5));
+        in_ema_ += ((double)(avail - target) - in_ema_) * alpha;
+        double rho = in_ema_ / ((double)kRate * 2.0);
+        rho = std::max(-0.001, std::min(0.001, rho));
+        const double step = 1.0 + rho;
+        const size_t need = (size_t)std::floor(in_frac_ + (double)(n - 1) * step) + 2;
+        if (avail < (int64_t)need) {  // not enough data: silence, re-prime on the next block
+            std::fill(out, out + total, 0.f);
+            in_started_ = false;
+            in_underruns_++;
+            map_.set_in_metrics(in_underruns_, avail - target, (int64_t)std::llround(rho * 1e6));
+            return;
+        }
+        tmp_.resize(need * shm::CH);
+        map_.read_frames(shm::In, in_rd_, tmp_.data(), need);
+        for (size_t i = 0; i < n; i++) {
+            const double p = in_frac_ + (double)i * step;
+            const size_t i0 = (size_t)p;
+            const float f = (float)(p - (double)i0);
+            for (int c = 0; c < shm::CH; c++) {
+                const float a = tmp_[i0 * shm::CH + (size_t)c];
+                const float b = tmp_[(i0 + 1) * shm::CH + (size_t)c];
+                out[i * shm::CH + (size_t)c] = a + (b - a) * f;
+            }
+        }
+        const double end = in_frac_ + (double)n * step;
+        const size_t adv = (size_t)std::floor(end);
+        in_frac_ = end - (double)adv;
+        in_rd_ += (uint64_t)adv;
+        map_.set_in_metrics(in_underruns_, avail - target, (int64_t)std::llround(rho * 1e6));
+    }
+
+    // Legacy version (Stage B v1): drops or repeats one sample when the lead leaves +-5 ms.
+    void readInputLegacy(size_t n, float* out) {
         const size_t total = n * shm::CH;
         if (!map_.ok()) {
             std::fill(out, out + total, 0.f);
@@ -487,6 +555,9 @@ private:
     std::atomic<uint64_t> stamp_ns_{0};
     shm::Mapping map_;
     uint64_t in_rd_ = 0;
+    double in_frac_ = 0.0;
+    double in_ema_ = 0.0;
+    uint64_t in_underruns_ = 0;
     bool in_started_ = false;
     std::vector<float> tmp_;
 };
