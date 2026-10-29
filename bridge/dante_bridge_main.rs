@@ -17,7 +17,7 @@ mod shm;
 use std::collections::{BTreeMap, VecDeque};
 use std::net::Ipv4Addr;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
@@ -33,6 +33,11 @@ const RATE: u32 = 48000;
 const RING: usize = 65536;
 const TX_TOL: isize = 240;
 const TX_RESYNC: isize = 4800;
+/// Smooth TX drift compensation: time constant of the error filter, time over which an error is
+/// removed, and the largest speed change (1000 ppm = 0.1 %, about 1.7 cents).
+const TX_EMA_SECONDS: f64 = 0.5;
+const TX_CORRECTION_SECONDS: f64 = 2.0;
+const TX_MAX_RATE_ADJ: f64 = 0.001;
 
 /// How long to wait for the first PTP Sync before giving up.
 /// Kept generous because a Gigabit switch may need ~10 s to flood the
@@ -65,6 +70,12 @@ struct Config {
     tx_latency_ms: u32,
     log_level: String,
     use_asio: bool,
+    /// ask Windows for 1 ms timer ticks and a high priority class
+    perf_boost: bool,
+    /// "smooth" (resampling, default) or "legacy" (drop/repeat one sample) - Windows -> Dante direction
+    tx_drift_mode: String,
+    /// "smooth" or "legacy" - Dante -> ASIO inputs direction (applied by the ASIO driver)
+    rx_drift_mode: String,
 }
 
 impl Default for Config {
@@ -80,6 +91,9 @@ impl Default for Config {
             tx_latency_ms: 40,
             log_level: "info".into(),
             use_asio: false,
+            perf_boost: true,
+            tx_drift_mode: "smooth".into(),
+            rx_drift_mode: "smooth".into(),
         }
     }
 }
@@ -119,6 +133,13 @@ struct Stats {
     asio_host: AtomicBool,
     /// milliseconds since the PTP clock overlay last changed (u64::MAX = never)
     ptp_age_ms: AtomicU64,
+    tx_err_last: AtomicI64, // TX write position minus media clock (samples): >0 = ahead
+    tx_err_peak: AtomicU64, // largest |error| since the last reset (samples)
+    tx_rate_ppm: AtomicI64, // current TX speed adjustment (smooth mode)
+    asio_in_lead: AtomicI64, // driver input queue lead vs target (frames)
+    asio_in_underruns: AtomicU64,
+    asio_in_ppm: AtomicI64,
+    asio_driver_ver: AtomicU64,
 }
 
 impl Stats {
@@ -132,6 +153,13 @@ impl Stats {
             tx_peaks: (0..tx_ch).map(|_| AtomicU32::new(0)).collect(),
             asio_host: AtomicBool::new(false),
             ptp_age_ms: AtomicU64::new(u64::MAX),
+            tx_err_last: AtomicI64::new(0),
+            tx_err_peak: AtomicU64::new(0),
+            tx_rate_ppm: AtomicI64::new(0),
+            asio_in_lead: AtomicI64::new(0),
+            asio_in_underruns: AtomicU64::new(0),
+            asio_in_ppm: AtomicI64::new(0),
+            asio_driver_ver: AtomicU64::new(0),
             rx_dev: (0..rx_devs)
                 .map(|_| DevStat {
                     buf_frames: AtomicU64::new(0),
@@ -145,6 +173,7 @@ impl Stats {
     fn reset_counters(&self) {
         self.tx_corrections.store(0, Ordering::Relaxed);
         self.tx_resyncs.store(0, Ordering::Relaxed);
+        self.tx_err_peak.store(0, Ordering::Relaxed);
         for d in &self.rx_dev {
             d.under.store(0, Ordering::Relaxed);
             d.over.store(0, Ordering::Relaxed);
@@ -408,10 +437,86 @@ struct TxWriter {
     media: MediaClock,
     clock_rx: RealTimeClockReceiver,
     st: Arc<Stats>,
+    smooth: bool,
+    ema: f64,       // filtered write-position error (samples)
+    pos: f64,       // fractional read position in the input, relative to the next chunk
+    prev: Vec<f32>, // last input sample of the previous chunk, per channel
 }
 
 impl TxWriter {
     fn push(&mut self, data: &[f32], in_ch: usize) {
+        if self.smooth {
+            self.push_smooth(data, in_ch);
+        } else {
+            self.push_legacy(data, in_ch);
+        }
+    }
+
+    /// Smooth drift compensation: the write position error is low-pass filtered and removed by a
+    /// tiny continuous speed change (linear interpolation) instead of dropping/repeating samples.
+    fn push_smooth(&mut self, data: &[f32], in_ch: usize) {
+        let n = data.len() / in_ch;
+        if n == 0 {
+            return;
+        }
+        self.clock_rx.update();
+        if let Some(o) = self.clock_rx.get() {
+            self.media.update_overlay(*o);
+        }
+        let now = match self.media.wrapping_now_in_timebase(RATE as u64) {
+            Some(v) => v,
+            None => return,
+        };
+        let m = now.wrapping_sub(self.start) as isize;
+        if self.first {
+            self.w = (m - n as isize).max(0) as usize;
+            self.first = false;
+        }
+        let e = (self.w + n) as isize - m; // >0: we are ahead of the media clock
+        self.st.tx_err_last.store(e as i64, Ordering::Relaxed);
+        self.st.tx_err_peak.fetch_max(e.unsigned_abs() as u64, Ordering::Relaxed);
+        if e.abs() > TX_RESYNC {
+            self.w = (m - n as isize).max(0) as usize;
+            self.pos = 0.0;
+            self.ema = 0.0;
+            self.st.tx_resyncs.fetch_add(1, Ordering::Relaxed);
+        } else {
+            let alpha = (n as f64 / (RATE as f64 * TX_EMA_SECONDS)).min(1.0);
+            self.ema += (e as f64 - self.ema) * alpha;
+        }
+        // ahead of the clock -> consume input faster, i.e. write fewer samples
+        let rho = (self.ema / (RATE as f64 * TX_CORRECTION_SECONDS)).clamp(-TX_MAX_RATE_ADJ, TX_MAX_RATE_ADJ);
+        let step = 1.0 / (1.0 - rho);
+        self.st.tx_rate_ppm.store((rho * 1e6).round() as i64, Ordering::Relaxed);
+
+        let last = (n - 1) as f64;
+        let mut written = 0usize;
+        let mut peaks = [0f32; 16];
+        while self.pos < last {
+            let i0: isize = if self.pos < 0.0 { -1 } else { self.pos as isize };
+            let frac = (self.pos - i0 as f64) as f32;
+            for c in 0..self.per {
+                let a = if i0 < 0 { self.prev[c] } else { data[i0 as usize * in_ch + c] };
+                let b = data[(i0 + 1) as usize * in_ch + c];
+                let s = a + (b - a) * frac;
+                peaks[c] = peaks[c].max(s.abs());
+                let v = (s.clamp(-1.0, 1.0) as f64 * 2147483647.0) as i32;
+                self.bufs[c][(self.w + written) & (RING - 1)].store(v, Ordering::Relaxed);
+            }
+            written += 1;
+            self.pos += step;
+        }
+        self.pos -= n as f64;
+        for c in 0..self.per {
+            self.prev[c] = data[(n - 1) * in_ch + c];
+            self.st.tx_peaks[self.ch_base + c].fetch_max(peaks[c].to_bits(), Ordering::Relaxed);
+        }
+        self.w += written;
+        self.st.tx_frames.fetch_add(n as u64, Ordering::Relaxed);
+    }
+
+    /// Original behaviour: drop or repeat one sample when the error leaves +-TX_TOL.
+    fn push_legacy(&mut self, data: &[f32], in_ch: usize) {
         let n = data.len() / in_ch;
         if n == 0 {
             return;
@@ -431,6 +536,8 @@ impl TxWriter {
             self.first = false;
         }
         let e = (self.w + n) as isize - m;
+        self.st.tx_err_last.store(e as i64, Ordering::Relaxed);
+        self.st.tx_err_peak.fetch_max(e.unsigned_abs() as u64, Ordering::Relaxed);
         let mut n_out = n as isize;
         if e.abs() > TX_RESYNC {
             self.w = (m - n as isize).max(0) as usize;
@@ -464,12 +571,35 @@ fn asio_reader(mut writer: TxWriter, shm: Arc<shm::Shm>, shared: Arc<Shared>, st
     let mut rd = shm.write_pos(shm::Dir::Out);
     let mut buf: Vec<f32> = Vec::new();
     let mut last_data = Instant::now();
-    let mut last_push = Instant::now();
+    let mut idle: Option<(Instant, u64)> = None; // (start of the idle period, silence frames sent so far)
     let mut last_beat = shm.driver_beat();
     let mut last_beat_change = Instant::now();
+    let mut last_report = Instant::now();
+    let mut last_fixes = 0u64;
     while !shared.stop.load(Ordering::Relaxed) {
         std::thread::sleep(Duration::from_millis(2));
         shm.bump_bridge_beat();
+        if last_report.elapsed() >= Duration::from_secs(10) {
+            last_report = Instant::now();
+            let fixes = st.tx_corrections.load(Ordering::Relaxed);
+            log::info!(
+                "[rx] driver_v{} queue_lead={:+.1} ms underruns={} rate={:+} ppm",
+                st.asio_driver_ver.load(Ordering::Relaxed),
+                st.asio_in_lead.load(Ordering::Relaxed) as f64 * 1000.0 / RATE as f64,
+                st.asio_in_underruns.load(Ordering::Relaxed),
+                st.asio_in_ppm.load(Ordering::Relaxed)
+            );
+            log::info!(
+                "[tx] frames={} drift_fixes(+{} in 10 s) resyncs={} timing_error_last={:+.1} ms peak={:.1} ms rate={:+} ppm",
+                st.tx_frames.load(Ordering::Relaxed),
+                fixes - last_fixes,
+                st.tx_resyncs.load(Ordering::Relaxed),
+                st.tx_err_last.load(Ordering::Relaxed) as f64 * 1000.0 / RATE as f64,
+                st.tx_err_peak.load(Ordering::Relaxed) as f64 * 1000.0 / RATE as f64,
+                st.tx_rate_ppm.load(Ordering::Relaxed)
+            );
+            last_fixes = fixes;
+        }
         let beat = shm.driver_beat();
         if beat != last_beat {
             last_beat = beat;
@@ -477,6 +607,11 @@ fn asio_reader(mut writer: TxWriter, shm: Arc<shm::Shm>, shared: Arc<Shared>, st
         }
         st.asio_host
             .store(last_beat_change.elapsed() < Duration::from_millis(1000), Ordering::Relaxed);
+        let (in_under, in_lead, in_ppm) = shm.rx_metrics();
+        st.asio_in_underruns.store(in_under, Ordering::Relaxed);
+        st.asio_in_lead.store(in_lead, Ordering::Relaxed);
+        st.asio_in_ppm.store(in_ppm, Ordering::Relaxed);
+        st.asio_driver_ver.store(shm.driver_version() as u64, Ordering::Relaxed);
 
         let wp = shm.write_pos(shm::Dir::Out);
         let mut avail = wp.wrapping_sub(rd) as i64;
@@ -490,14 +625,18 @@ fn asio_reader(mut writer: TxWriter, shm: Arc<shm::Shm>, shared: Arc<Shared>, st
             rd = wp;
             writer.push(&buf, ch);
             last_data = Instant::now();
-            last_push = last_data;
+            idle = None;
         } else if last_data.elapsed() > Duration::from_millis(60) {
-            let n = (last_push.elapsed().as_secs_f64() * RATE as f64) as usize;
-            if n > 0 {
+            // no ASIO host is playing: keep the Dante ring filled with silence at exactly the media rate
+            // (counted against one fixed start time, so no fractional sample is ever lost)
+            let (t0, sent) = idle.get_or_insert((Instant::now(), 0));
+            let due = (t0.elapsed().as_secs_f64() * RATE as f64) as u64;
+            if due > *sent {
+                let n = (due - *sent) as usize;
                 buf.clear();
                 buf.resize(n * ch, 0.0);
                 writer.push(&buf, ch);
-                last_push = Instant::now();
+                *sent = due;
             }
         }
     }
@@ -539,6 +678,15 @@ async fn run_engine(cfg: Config, shared: Arc<Shared>, tone: bool) -> Result<(), 
         tx_devs.push(d);
     }
     let use_asio = cfg.use_asio;
+    let tx_smooth = cfg.tx_drift_mode.trim().to_lowercase() != "legacy";
+    let rx_smooth = cfg.rx_drift_mode.trim().to_lowercase() != "legacy";
+    log::info!(
+        "[mode] perf_boost={} tx_drift_mode={} rx_drift_mode={} use_asio={}",
+        cfg.perf_boost,
+        if tx_smooth { "smooth" } else { "legacy" },
+        if rx_smooth { "smooth" } else { "legacy" },
+        use_asio
+    );
     let tx_devs: Vec<cpal::Device> = if use_asio { Vec::new() } else { tx_devs };
 
     for d in &rx_devs {
@@ -642,6 +790,7 @@ async fn run_engine(cfg: Config, shared: Arc<Shared>, tone: bool) -> Result<(), 
     let asio_shm: Option<Arc<shm::Shm>> = if use_asio {
         let m = shm::Shm::open().map_err(|e| format!("shared memory: {e}"))?;
         m.reset();
+        m.init_layout(if rx_smooth { shm::FLAG_RX_SMOOTH } else { 0 });
         Some(Arc::new(m))
     } else {
         None
@@ -761,6 +910,10 @@ async fn run_engine(cfg: Config, shared: Arc<Shared>, tone: bool) -> Result<(), 
                 media,
                 clock_rx,
                 st: stats.clone(),
+                smooth: tx_smooth,
+                ema: 0.0,
+                pos: 0.0,
+                prev: vec![0.0; per],
             };
             tx_streams.push(build_input(dev, per, move |data, in_ch| writer.push(data, in_ch))?);
         }
@@ -788,6 +941,10 @@ async fn run_engine(cfg: Config, shared: Arc<Shared>, tone: bool) -> Result<(), 
                 media,
                 clock_rx,
                 st: stats.clone(),
+                smooth: tx_smooth,
+                ema: 0.0,
+                pos: 0.0,
+                prev: vec![0.0; shm::CH],
             });
         }
 
@@ -1071,6 +1228,26 @@ impl eframe::App for App {
                                 })
                                 .small(),
                             );
+                            cols[0].label(
+                                egui::RichText::new(format!(
+                                    "input queue {:+.1} ms vs target   underruns {}   rate {:+} ppm",
+                                    s.asio_in_lead.load(Ordering::Relaxed) as f64 * 1000.0 / RATE as f64,
+                                    s.asio_in_underruns.load(Ordering::Relaxed),
+                                    s.asio_in_ppm.load(Ordering::Relaxed)
+                                ))
+                                .small(),
+                            );
+                            let drv_ver = s.asio_driver_ver.load(Ordering::Relaxed);
+                            if host_on && drv_ver != shm::DRIVER_VERSION as u64 {
+                                cols[0].label(
+                                    egui::RichText::new(format!(
+                                        "ASIO driver build is v{drv_ver}, this app needs v{} - reinstall stageB",
+                                        shm::DRIVER_VERSION
+                                    ))
+                                    .small()
+                                    .color(egui::Color32::from_rgb(220, 60, 60)),
+                                );
+                            }
                             for gi in 0..shm::CH {
                                 if gi < self.rx_disp.len() {
                                     meter_bar(&mut cols[0], &format!("RX{}", gi + 1), self.rx_disp[gi]);
@@ -1085,9 +1262,12 @@ impl eframe::App for App {
                             );
                             cols[1].label(
                                 egui::RichText::new(format!(
-                                    "drift fixes {}   resyncs {}",
+                                    "drift fixes {}   resyncs {}   timing error {:+.1} ms (peak {:.1} ms)   rate {:+} ppm",
                                     s.tx_corrections.load(Ordering::Relaxed),
-                                    s.tx_resyncs.load(Ordering::Relaxed)
+                                    s.tx_resyncs.load(Ordering::Relaxed),
+                                    s.tx_err_last.load(Ordering::Relaxed) as f64 * 1000.0 / RATE as f64,
+                                    s.tx_err_peak.load(Ordering::Relaxed) as f64 * 1000.0 / RATE as f64,
+                                    s.tx_rate_ppm.load(Ordering::Relaxed)
                                 ))
                                 .small(),
                             );
@@ -1146,9 +1326,12 @@ impl eframe::App for App {
                         );
                         cols[1].label(
                             egui::RichText::new(format!(
-                                "drift fixes {}   resyncs {}",
+                                "drift fixes {}   resyncs {}   timing error {:+.1} ms (peak {:.1} ms)   rate {:+} ppm",
                                 s.tx_corrections.load(Ordering::Relaxed),
-                                s.tx_resyncs.load(Ordering::Relaxed)
+                                s.tx_resyncs.load(Ordering::Relaxed),
+                                s.tx_err_last.load(Ordering::Relaxed) as f64 * 1000.0 / RATE as f64,
+                                s.tx_err_peak.load(Ordering::Relaxed) as f64 * 1000.0 / RATE as f64,
+                                s.tx_rate_ppm.load(Ordering::Relaxed)
                             ))
                             .small(),
                         );
@@ -1279,6 +1462,31 @@ impl eframe::App for App {
     }
 }
 
+/// Windows defaults to a 15.6 ms timer tick, which makes every short sleep ~15 ms and
+/// lets the real-time threads be descheduled. Ask for 1 ms ticks and a high priority class.
+#[cfg(windows)]
+mod winperf {
+    #[link(name = "winmm")]
+    extern "system" {
+        fn timeBeginPeriod(period_ms: u32) -> u32;
+    }
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetCurrentProcess() -> isize;
+        fn SetPriorityClass(process: isize, class: u32) -> i32;
+    }
+    const HIGH_PRIORITY_CLASS: u32 = 0x0000_0080;
+
+    pub fn boost() {
+        // SAFETY: plain Win32 calls with valid arguments; GetCurrentProcess returns a pseudo-handle.
+        unsafe {
+            let timer = timeBeginPeriod(1);
+            let prio = SetPriorityClass(GetCurrentProcess(), HIGH_PRIORITY_CLASS);
+            log::info!("[perf] timeBeginPeriod(1) -> {timer} (0 = ok), SetPriorityClass(HIGH) -> {prio} (non-zero = ok)");
+        }
+    }
+}
+
 fn main() -> eframe::Result<()> {
     let mut note = String::new();
     let cfg: Config = match std::fs::read_to_string(config_path()) {
@@ -1302,6 +1510,10 @@ fn main() -> eframe::Result<()> {
         b.init();
     }
     std::panic::set_hook(Box::new(|info| log::error!("PANIC: {info}")));
+    #[cfg(windows)]
+    if cfg.perf_boost {
+        winperf::boost();
+    }
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
